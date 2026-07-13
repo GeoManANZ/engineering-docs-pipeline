@@ -1,8 +1,43 @@
-# Engineering Docs Pipeline v2
+# Engineering Docs Pipeline v3
 
-Multi-format document converter for engineering libraries. Converts PDF, DOCX, and XLSX files to Markdown with GPU-accelerated OCR, formula extraction, and OneDrive space management.
+Multi-format document converter for engineering libraries. Converts PDF, DOCX, and XLSX files to Markdown with GPU-accelerated OCR, formula extraction, pre-fetch staging, and OneDrive space management.
 
-## Quick Reference
+## What Changed in v3
+
+| v2 | v3 |
+|----|----|
+| Download → convert → free per file | Stage 10 files ahead, convert from staging |
+| Converter thread idle during downloads | Zero idle — downloads are pre-fetched |
+| All .md files flat in `~/engineering-md/` | Preserves source folder structure |
+| Files downloaded from OneDrive at convert time | Staged locally, OneDrive freed immediately |
+
+---
+
+## How It Works
+
+```
+┌─ On a single file ───────────────────────────────────────┐
+│                                                           │
+│  1. stage_file(rel):                                      │
+│     └── ensure_local() — triggers OneDrive download       │
+│     └── shutil.copy2() — copies to .staging/ directory    │
+│     └── free_onedrive_space() — reclaims OneDrive copy    │
+│                                                           │
+│  2. process_single_file():                                │
+│     └── convert_pdf() or convert_office() — from staging  │
+│     └── saves .md to engineering-md/ (folder preserved)   │
+│                                                           │
+│  3. Staging file deleted after chunk completes            │
+└───────────────────────────────────────────────────────────┘
+```
+
+**Pre-fetch buffer:** While file 1 is being converted, files 2-11 are being downloaded to staging. By the time the converter reaches file 10, it's already local. No idle time.
+
+**Disk usage at peak:** `DOWNLOAD_AHEAD` × average file size. With 10 files at ~10MB each = ~100MB. Files are deleted from staging after each chunk (50 files).
+
+---
+
+## Quick Start
 
 ```bash
 git clone git@github.com:GeoManANZ/engineering-docs-pipeline.git
@@ -10,16 +45,6 @@ cd engineering-docs-pipeline
 bash setup.sh
 python3 pipeline.py --test
 ```
-
----
-
-## Prerequisites
-
-1. **G14 laptop** with WSL2 (Ubuntu)
-2. **NVIDIA GPU** + CUDA drivers installed in WSL2
-3. **Python 3.10+** (should already be there)
-4. **Java 17+**: `sudo apt install openjdk-17-jdk`
-5. **OneDrive folder**: `C:\Users\Chris\OneDrive\02. Work`
 
 ---
 
@@ -32,68 +57,41 @@ git clone git@github.com:GeoManANZ/engineering-docs-pipeline.git
 cd engineering-docs-pipeline
 ```
 
-### Step 2: Run Setup (Creates venv + Installs Tools)
+### Step 2: Run Setup
 
 ```bash
 bash setup.sh
 ```
 
-This creates `~/pdf-convert-venv/` and installs:
+Creates `~/pdf-convert-venv/` and installs:
 - `opendataloader-pdf[hybrid]` — GPU-accelerated PDF converter
-- `markitdown[all]` — DOCX/XLSX converter (Microsoft)
+- `markitdown[all]` — DOCX/XLSX converter
 
-**Time:** ~5 minutes (mostly downloading models)
+**Time:** ~5 minutes.
 
 ### Step 3: Create the Symlink (Recommended)
 
-Your OneDrive folder path has spaces:
-
+Your OneDrive path has spaces:
 ```
 /mnt/c/Users/Chris/OneDrive/02. Work
 ```
 
-That space makes every command awkward — you'd need to quote it every time. A symlink solves this:
+Create a symlink so you never have to quote spaces:
 
 ```bash
 ln -s "/mnt/c/Users/Chris/OneDrive/02. Work" ~/work-docs
 ```
 
-**What this does:** Creates a shortcut at `~/work-docs` that points to your OneDrive folder. Now you can type `~/work-docs` instead of the full path with quotes.
+Now `~/work-docs` points to your OneDrive folder. The pipeline auto-detects this path.
 
-**Why it matters:**
-- No quoting spaces: `ls ~/work-docs` vs `ls "/mnt/c/Users/Chris/OneDrive/02. Work"`
-- No typing the full path every time
-- Works in every tool (Python, shell, etc.)
-- If you ever move the folder, update one symlink, not every script
-
-### Step 4: Configure the Pipeline
-
-Edit `pipeline.py` and find the `CONFIGURATION` section (top of file):
-
-```python
-# Option A: With symlink (from Step 3)
-import os
-ONEDRIVE_ROOT = os.path.expanduser("~/work-docs")
-
-# Option B: Direct path (no symlink)
-ONEDRIVE_ROOT = "/mnt/c/Users/Chris/OneDrive/02. Work"
-```
-
-Replace `<YOUR_USERNAME>` if needed. Verify it works:
-
+Verify it works:
 ```bash
 ls ~/work-docs/
-# or
-ls "/mnt/c/Users/Chris/OneDrive/02. Work/"
 ```
 
-You should see your files and folders.
+### Step 4: Start the Hybrid Server (Terminal 1)
 
-### Step 5: Start the Hybrid Server (Terminal 1)
-
-This is the GPU-powered backend that converts PDFs. It loads AI models into your GPU and stays running. **You need this running whenever you process PDFs.**
-
-Open a terminal and run:
+Open a terminal, start the GPU backend:
 
 ```bash
 cd ~/pdf-convert-venv
@@ -103,16 +101,13 @@ opendataloader-pdf-hybrid --port 5002 \
   --enrich-formula --enrich-picture-description
 ```
 
-You'll see:
-```
-INFO: Uvicorn running on http://0.0.0.0:5002
-```
+You'll see: `INFO: Uvicorn running on http://0.0.0.0:5002`
 
 **Do not close this terminal.** It's the engine. Leave it running.
 
-### Step 6: Run the Test Batch (Terminal 2)
+### Step 5: Run the Test Batch (Terminal 2)
 
-Open a **second terminal** and run:
+Open a second terminal:
 
 ```bash
 cd ~/engineering-docs-pipeline
@@ -120,35 +115,41 @@ python3 pipeline.py --test
 ```
 
 **What happens:**
-1. Scans your OneDrive folder (counts all PDF/DOCX/XLSX)
-2. Picks the first 50 files
-3. For each file: downloads from OneDrive → converts → frees local disk space
-4. Saves `.md` to `~/engineering-md/`
-5. Prints a summary
+1. Scans OneDrive (counts PDF/DOCX/XLSX)
+2. Picks first 50 files
+3. Starts downloading 10 files to staging
+4. As file 1 converts, file 11 starts downloading
+5. Frees OneDrive space after each file is staged
+6. Prints summary
 
-**Time:** ~5-10 minutes for 50 files (depends on file sizes)
+**Time:** ~5-10 minutes.
 
-**How to check it worked:**
-
+**Check results:**
 ```bash
-ls ~/engineering-md/          # See converted files
-python3 pipeline.py --status  # See progress breakdown
-python3 pipeline.py --failed  # See any errors
+ls ~/engineering-md/          # See folder structure
+python3 pipeline.py --status  # Progress breakdown
+python3 pipeline.py --failed  # Any errors
 ```
 
-### Step 7: Run the Full Pipeline
-
-Once the test looks good:
+### Step 6: Run the Full Pipeline
 
 ```bash
 python3 pipeline.py
 ```
 
-The pipeline:
-- Resumes where `--test` left off
-- Only processes new/changed files on subsequent runs
-- Safe to stop (Ctrl+C) and restart — uses SQLite tracking
-- Can run overnight — it's self-logging and resume-safe
+Resumes where `--test` left off. Subsequent runs only process new/changed files.
+
+---
+
+## Folder Structure Preserved
+
+| Source | Output |
+|--------|--------|
+| `02. Work/Geotech/report.pdf` | `~/engineering-md/Geotech/report.md` |
+| `02. Work/Subsea/pipeline.xlsx` | `~/engineering-md/Subsea/pipeline.md` |
+| `02. Work/Specs/2024/spec.docx` | `~/engineering-md/Specs/2024/spec.md` |
+
+The entire folder hierarchy is mirrored in `~/engineering-md/`. No filename collisions.
 
 ---
 
@@ -156,87 +157,56 @@ The pipeline:
 
 | Command | What it does |
 |---------|-------------|
-| `python3 pipeline.py --test` | Convert first 50 files (test quality) |
-| `python3 pipeline.py` | Full run — resumes from last checkpoint |
-| `python3 pipeline.py --status` | Show progress without converting |
-| `python3 pipeline.py --scan-only` | Index files without converting |
-| `python3 pipeline.py --failed` | List failed files with error details |
-| `python3 pipeline.py --retry-failed` | Re-attempt only failed files |
-| `python3 pipeline.py --reset` | Delete tracking database (start over) |
+| `--test` | Convert first 50 files |
+| *(no args)* | Full run — resumes from checkpoint |
+| `--status` | Show progress |
+| `--scan-only` | Index files without converting |
+| `--failed` | List failed files with errors |
+| `--retry-failed` | Re-attempt only failed files |
+| `--reset` | Start over |
 
 ---
 
-## What Converts What
+## Configuration
 
-| Format | Converter | How |
-|--------|-----------|-----|
-| `.pdf` | opendataloader-pdf hybrid | Sent to GPU server on port 5002 |
-| `.docx` | MarkItDown (Microsoft) | Local processing, no GPU needed |
-| `.xlsx` | MarkItDown | Local processing |
-| `.doc` `.xls` `.ppt` | **Skipped** | Legacy formats — convert manually first |
+Edit the top of `pipeline.py`:
 
----
-
-## Why the Hybrid Server?
-
-The hybrid server is a **separate long-running process** for a reason: loading the AI models into GPU memory takes ~30 seconds. If we loaded/unloaded it per file, a 50-file test would take 25 minutes just loading. Running it once as a persistent server eliminates that overhead.
-
-**Analogy:** It's like a database server. You start PostgreSQL once, then your app queries it. Same pattern here — start the server once, then the pipeline sends it PDFs.
+| Setting | Default | What it does |
+|---------|---------|-------------|
+| `DOWNLOAD_AHEAD` | 10 | Files pre-fetched to staging before conversion |
+| `BATCH_SIZE` | 50 | Files per batch (staging cleaned between batches) |
+| `IO_WORKERS` | 4 | Parallel threads for downloading + staging |
+| `MAX_RETRIES` | 3 | Retry attempts per file |
+| `FREE_SPACE_AFTER_STAGING` | True | Free OneDrive space after copying to staging |
+| `RSYNC_TARGET` | "" | Set to VPS address for auto-sync |
 
 ---
 
-## OneDrive Space Management
+## Disk Usage During Run
 
-The pipeline downloads files from OneDrive, converts them, then frees the local disk space:
+| What | How much |
+|------|----------|
+| Staging files (peak) | `DOWNLOAD_AHEAD` × avg file size (~100MB) |
+| Converted .md files | Same as source (but accumulates) |
+| SQLite database | Negligible (< 10MB for 123k files) |
 
-```
-File is cloud-only (placeholder)
-  → pipeline.py calls ensure_local()
-  → OneDrive downloads the file
-  → opendataloader-pdf converts to .md
-  → free_onedrive_space() runs: attrib.exe +U -P
-  → OneDrive reclaims the local copy
-```
-
-**You don't need 154GB free disk space.** Only enough for the files currently being processed (~1-2GB for the current batch).
-
-**`attrib.exe` flags:**
-- `+U` = unpin (mark as "online-only" — cloud only, no local copy)
-- `-P` = clear "always available" flag
-
-This works from WSL2 via `/mnt/c/Windows/system32/attrib.exe`.
-
----
-
-## Output Files
-
-| File | Location | Purpose |
-|------|----------|---------|
-| Converted docs | `~/engineering-md/*.md` | Your Markdown documents |
-| Progress database | `~/engineering-md/.pipeline.db` | SQLite — tracks every file |
-| Log file | `~/engineering-md/pipeline.log` | Full conversion log |
+Staging is cleaned after each batch. .md files accumulate in `~/engineering-md/`.
 
 ---
 
 ## Incremental Updates (Nightly Cron)
 
-After the initial conversion, subsequent runs are fast. Periodically re-scan to catch new files:
-
 ```bash
 crontab -e
-```
-Add:
-```
+# Add:
 0 2 * * * cd ~/engineering-docs-pipeline && python3 pipeline.py >> ~/engineering-md/cron.log 2>&1
 ```
 
-This runs at 2am every night — scans OneDrive, processes only new/changed files.
+**Post-conversion filing:** After .md files are synced to VPS and ingested into gbrain, the folder structure on the VPS (`/data/engineering-docs/Geotech/`, `/data/engineering-docs/Subsea/`, etc.) is ready for browsing. gbrain indexes all files for semantic search regardless of folder layout. No additional filing step needed beyond what the pipeline already produces.
 
 ---
 
 ## After Conversion: gbrain Ingestion
-
-Once `.md` files are on the VPS, index for semantic search:
 
 ```bash
 # On VPS
@@ -246,81 +216,19 @@ gbrain embed --stale
 
 ---
 
-## Accuracy
-
-| Metric | Score | Tool |
-|--------|-------|------|
-| Overall accuracy | 0.907 | #1 of 12 converters |
-| Table extraction | 0.928 | Critical for engineering specs |
-| Reading order | 0.934 | Multi-column layouts |
-| Formula → LaTeX | ✅ | `--enrich-formula` flag |
-| Figure captions | ✅ | `--enrich-picture-description` flag |
-
-The hybrid server command uses every accuracy-enhancing flag available:
-
-```bash
-opendataloader-pdf-hybrid --port 5002 \
-  --force-ocr              # OCR every page (scanned docs)
-  --ocr-engine rapidocr     # ONNX-based OCR engine
-  --device cuda             # Use GPU (10-50x faster)
-  --enrich-formula          # Extract equations as LaTeX
-  --enrich-picture-description  # Describe figures/charts
-```
-
----
-
 ## Troubleshooting
 
 **"Source path does not exist"**
-```bash
-ls "/mnt/c/Users/Chris/OneDrive/02. Work/"
-```
-If this fails, OneDrive isn't mounted in WSL2. Check: `ls /mnt/c/`
+→ Check: `ls "/mnt/c/Users/Chris/OneDrive/02. Work/"` or `ls ~/work-docs/`
 
 **"Hybrid server not running"**
-→ Start Terminal 1 first. The server must be running before processing PDFs.
-→ If only processing DOCX/XLSX: the pipeline skips the server check (no PDFs pending).
+→ Start Terminal 1 first
 
 **"Download timeout"**
-→ OneDrive may be syncing or network is slow. The file gets marked as failed.
-→ Run `python3 pipeline.py --retry-failed` later.
-
-**"opendataloader_pdf not installed"**
-→ The venv isn't activated. Run: `cd ~/pdf-convert-venv && source bin/activate`
+→ OneDrive network issue. File gets retried 3 times. Run `--retry-failed` later.
 
 **Disk space filling up**
-→ Check `FREE_SPACE_AFTER_CONVERT = True` in pipeline.py
-→ Wait — OneDrive can take a minute to reclaim space after `attrib.exe`
-→ Verify attrib works manually:
-```bash
-/mnt/c/Windows/system32/attrib.exe +U -P "/mnt/c/Users/Chris/OneDrive/02. Work/somefile.pdf"
-```
-
-**Pipeline crashed mid-run**
-→ Just run it again: `python3 pipeline.py` — it resumes from the last completed file.
-
----
-
-## Architecture
-
-```
-┌─ G14 (WSL2) ──────────────────────────────────────────────┐
-│                                                             │
-│  Terminal 1: Hybrid Server (GPU)                            │
-│  └── opendataloader-pdf-hybrid :5002                        │
-│      --enrich-formula --enrich-picture-description          │
-│                                                             │
-│  Terminal 2: Pipeline                                       │
-│  └── pipeline.py --test                                     │
-│      Phase 1: Scan OneDrive (os.walk)                       │
-│      Phase 2: Check hybrid server                           │
-│      Phase 3: Process 50 files (parallel, 4 workers)        │
-│      │   per file:                                          │
-│      │   ├── ensure_local() — download from OneDrive        │
-│      │   ├── convert_file() — .pdf→GPU, .docx/.xlsx→CPU    │
-│      │   └── free_onedrive_space() — attrib.exe +U -P      │
-│      Phase 4: Report                                       │
-│                                                             │
-│  ~/engineering-md/*.md  ← Output                            │
-└─────────────────────────────────────────────────────────────┘
-```
+→ Check staging: `du -sh ~/engineering-md/.staging/`
+→ Check `FREE_SPACE_AFTER_STAGING = True` in config
+→ Increase `DOWNLOAD_AHEAD` if you see idle time during conversion
+→ Decrease `DOWNLOAD_AHEAD` if staging is too large

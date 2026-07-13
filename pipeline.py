@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-Engineering Docs Pipeline v2 — Multi-format PDF/DOCX/XLSX → Markdown
+Engineering Docs Pipeline v3 — Multi-format PDF/DOCX/XLSX → Markdown
 =====================================================================
 Self-contained, self-logging, resume-safe converter for engineering documents.
 Runs on G14 WSL2 with GPU-accelerated OCR for PDFs, MarkItDown for Office files.
+
+Key features:
+- Pre-fetch buffer: downloads next N files while converter works (no idle time)
+- Folder structure preserved: Subfolder/report.pdf → Subfolder/report.md
+- Stage → convert → free: files staged locally, OneDrive freed immediately
 
 Usage:
     python3 pipeline.py --test              # Test batch: 50 files, then stop
@@ -19,6 +24,7 @@ import argparse
 import gc
 import logging
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -32,11 +38,17 @@ from pathlib import Path
 # =============================================================================
 
 # OneDrive source folder (WSL2 path)
-# Symlink recommended: ln -s "/mnt/c/Users/Chris/OneDrive/02. Work" ~/work-docs
-ONEDRIVE_ROOT = "/mnt/c/Users/Chris/OneDrive/02. Work"
+# Create symlink first: ln -s "/mnt/c/Users/Chris/OneDrive/02. Work" ~/work-docs
+import os as _os
+ONEDRIVE_ROOT = _os.path.expanduser("~/work-docs") if _os.path.exists(
+    _os.path.expanduser("~/work-docs")
+) else "/mnt/c/Users/Chris/OneDrive/02. Work"
 
-# Where converted .md files are saved
+# Where converted .md files are saved (preserves source folder structure)
 MD_STORE = Path.home() / "engineering-md"
+
+# Temporary staging area for downloads (files live here during conversion)
+STAGE_DIR = MD_STORE / ".staging"
 
 # SQLite progress database
 PROGRESS_DB = MD_STORE / ".pipeline.db"
@@ -48,11 +60,15 @@ LOG_FILE = MD_STORE / "pipeline.log"
 HYBRID_URL = "http://localhost:5002"
 HYBRID_PORT = 5002
 
-# Parallel workers for file I/O (downloading from OneDrive)
+# Parallel workers for file I/O
 IO_WORKERS = 4
 
-# Files per batch (controls memory and rsync frequency)
-BATCH_SIZE = 500
+# Pre-fetch buffer: download this many files ahead of conversion
+# Higher = less idle time, more disk usage during staging
+DOWNLOAD_AHEAD = 10
+
+# Files per batch (controls how many files staged at once)
+BATCH_SIZE = 50
 
 # Test batch: how many files in --test mode
 TEST_BATCH_SIZE = 50
@@ -61,14 +77,14 @@ TEST_BATCH_SIZE = 50
 MAX_RETRIES = 3
 RETRY_DELAYS = [2, 8, 30]  # exponential backoff in seconds
 
-# Minimum output file size (bytes) — anything smaller is a failed conversion
+# Minimum output file size (bytes)
 SMALL_FILE_THRESHOLD = 100
 
 # rsync target (set to empty string to skip)
 RSYNC_TARGET = ""
 
-# Free OneDrive space after successful conversion?
-FREE_SPACE_AFTER_CONVERT = True
+# Free OneDrive space after staging?
+FREE_SPACE_AFTER_STAGING = True
 
 # File extensions to process
 PDF_EXTENSIONS = {".pdf"}
@@ -87,7 +103,6 @@ def setup_logging(log_file: Path) -> logging.Logger:
     log_file.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("pipeline")
     logger.setLevel(logging.DEBUG)
-    # Prevent duplicate handlers on reload
     if logger.handlers:
         return logger
 
@@ -144,10 +159,9 @@ def init_db(db_path: Path) -> sqlite3.Connection:
 
 def free_onedrive_space(path: str):
     """Mark a file as online-only (free local disk space)."""
-    if not FREE_SPACE_AFTER_CONVERT:
+    if not FREE_SPACE_AFTER_STAGING:
         return
     try:
-        # attrib.exe works from WSL2 on Windows paths
         win_path = subprocess.run(
             ["wslpath", "-w", path], capture_output=True, text=True
         ).stdout.strip()
@@ -161,23 +175,22 @@ def free_onedrive_space(path: str):
 def ensure_local(path: str, timeout: int = 120) -> bool:
     """
     Ensure a OneDrive file is downloaded locally.
-    Cloud-only placeholders may report a fake file size on WSL2, so we always
-    attempt to read the actual bytes. OneDrive downloads on access.
-    Returns True once we can read real data.
+    Cloud-only placeholders may report fake file sizes on WSL2, so always
+    attempt to read actual bytes. OneDrive downloads on access.
     """
     start = time.time()
     first_attempt = True
     while time.time() - start < timeout:
         try:
             with open(path, "rb") as f:
-                data = f.read(4096)  # Enough to trigger full download
+                data = f.read(4096)
             if data and data != b"\x00" * len(data):
                 return True
         except (OSError, IOError):
             pass
 
         if first_attempt:
-            log.info(f"  Waiting for OneDrive: {os.path.basename(path)}")
+            log.debug(f"  OneDrive fetch: {os.path.basename(path)}")
             first_attempt = False
         time.sleep(3)
 
@@ -185,14 +198,52 @@ def ensure_local(path: str, timeout: int = 120) -> bool:
     return False
 
 # =============================================================================
+# FILE STAGING (download → local staging → free OneDrive)
+# =============================================================================
+
+def stage_file(rel: str) -> Path | None:
+    """
+    Copy a file from OneDrive to local staging, then free OneDrive space.
+    Returns the staging path, or None on failure.
+    """
+    src = Path(ONEDRIVE_ROOT) / rel
+    dst = STAGE_DIR / rel
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    # Already staged?
+    if dst.exists() and dst.stat().st_size > 0:
+        return dst
+
+    # Ensure source is downloaded from OneDrive
+    if not ensure_local(str(src)):
+        return None
+
+    # Copy to staging
+    try:
+        shutil.copy2(str(src), str(dst))
+    except OSError as e:
+        log.warning(f"  Failed to stage {rel}: {e}")
+        return None
+
+    # Free OneDrive space immediately (local copy is in staging)
+    free_onedrive_space(str(src))
+
+    return dst
+
+def get_md_path(rel: str, md_store: Path) -> Path:
+    """
+    Convert source relative path to output .md path, preserving folder structure.
+    Example: Subfolder/report.pdf → ~/engineering-md/Subfolder/report.md
+    """
+    md_rel = Path(rel).with_suffix(".md")
+    return md_store / md_rel
+
+# =============================================================================
 # FILE SCANNING
 # =============================================================================
 
 def scan_files(root: str) -> list[tuple[str, int, float, str]]:
-    """
-    Walk the source folder and return (rel_path, size, mtime, ext) for all
-    supported files (.pdf, .docx, .xlsx).
-    """
+    """Walk source folder, return (rel_path, size, mtime, ext) for supported files."""
     results = []
     root_path = Path(root)
     if not root_path.exists():
@@ -215,7 +266,7 @@ def scan_files(root: str) -> list[tuple[str, int, float, str]]:
                 if count % 10000 == 0:
                     log.info(f"  Scanned {count:,} files...")
             except OSError:
-                continue  # Skip inaccessible files
+                continue
 
     log.info(f"Scan complete: {count:,} files ({sum(r[1] for r in results) / (1024**3):.1f} GB)")
     return results
@@ -224,24 +275,20 @@ def queue_new_files(conn: sqlite3.Connection, files: list[tuple[str, int, float,
     """Add new/changed files to the tracking database."""
     queued = 0
     for rel, size, mtime, ext in files:
-        # Check if file exists and is unchanged
         existing = conn.execute(
             "SELECT mtime, size_bytes, status FROM files WHERE rel_path=?", (rel,)
         ).fetchone()
 
         if existing:
-            # File exists — check if changed
             old_mtime, old_size, old_status = existing
             if old_mtime == mtime and old_size == size and old_status == "done":
                 continue  # Unchanged, already converted
-            # Changed — update and re-queue
             conn.execute(
                 "UPDATE files SET mtime=?, size_bytes=?, status='pending', error=NULL WHERE rel_path=?",
                 (mtime, size, rel)
             )
             queued += 1
         else:
-            # New file
             conn.execute(
                 "INSERT INTO files (rel_path, size_bytes, mtime, ext, status) VALUES (?, ?, ?, ?, 'pending')",
                 (rel, size, mtime, ext)
@@ -268,23 +315,23 @@ def check_hybrid_server(port: int = HYBRID_PORT) -> bool:
 # CONVERTERS
 # =============================================================================
 
-def convert_pdf(pdf_path: Path, output_dir: Path) -> dict:
+def convert_pdf(pdf_path: Path, output_path: Path) -> dict:
     """Convert PDF using opendataloader-pdf hybrid mode (GPU OCR)."""
     result = {"status": "done", "md_size": 0, "error": None}
     try:
         from opendataloader_pdf import convert
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         convert(
             input_path=[str(pdf_path)],
-            output_dir=str(output_dir),
+            output_dir=str(output_path.parent),
             format="markdown",
             hybrid="docling-fast",
             hybrid_mode="full",
             hybrid_url=HYBRID_URL,
             quiet=True,
         )
-        md_path = output_dir / (pdf_path.stem + ".md")
-        if md_path.exists():
-            result["md_size"] = md_path.stat().st_size
+        if output_path.exists():
+            result["md_size"] = output_path.stat().st_size
             if result["md_size"] < SMALL_FILE_THRESHOLD:
                 result["status"] = "tiny"
                 result["error"] = f"Output only {result['md_size']}B"
@@ -299,7 +346,7 @@ def convert_pdf(pdf_path: Path, output_dir: Path) -> dict:
         result["error"] = str(e)[:500]
     return result
 
-def convert_office(file_path: Path, output_dir: Path) -> dict:
+def convert_office(file_path: Path, output_path: Path) -> dict:
     """Convert DOCX/XLSX using MarkItDown."""
     result = {"status": "done", "md_size": 0, "error": None}
     try:
@@ -313,9 +360,9 @@ def convert_office(file_path: Path, output_dir: Path) -> dict:
             result["error"] = f"Output only {len(md_content)} chars"
             return result
 
-        md_path = output_dir / (file_path.stem + ".md")
-        md_path.write_text(md_content, encoding="utf-8")
-        result["md_size"] = md_path.stat().st_size
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(md_content, encoding="utf-8")
+        result["md_size"] = output_path.stat().st_size
 
     except ImportError:
         result["status"] = "error"
@@ -325,63 +372,42 @@ def convert_office(file_path: Path, output_dir: Path) -> dict:
         result["error"] = str(e)[:500]
     return result
 
-def convert_file(file_path: Path, output_dir: Path, ext: str) -> dict:
+def convert_file(file_path: Path, output_path: Path, ext: str) -> dict:
     """Route to the correct converter based on file extension."""
     if ext == ".pdf":
-        return convert_pdf(file_path, output_dir)
+        return convert_pdf(file_path, output_path)
     elif ext in {".docx", ".xlsx"}:
-        return convert_office(file_path, output_dir)
+        return convert_office(file_path, output_path)
     else:
         return {"status": "skipped", "md_size": 0, "error": f"Unsupported: {ext}"}
 
 # =============================================================================
-# FILE PROCESSING (with retry + free space)
+# FILE PROCESSING (stage → convert → cleanup)
 # =============================================================================
 
-def process_single_file(rel: str, ext: str, file_size: int, md_store: Path) -> dict:
+def process_single_file(rel: str, ext: str, file_size: int, staged_path: Path,
+                        md_store: Path) -> dict:
     """
-    Process a single file: ensure local → convert → free space.
-    Retries up to MAX_RETRIES on failure with exponential backoff.
-    Returns result dict with status, md_size, duration_s, error.
+    Convert a single file from staging to Markdown.
+    File is already downloaded and staged — no network I/O.
     """
-    full_path = Path(ONEDRIVE_ROOT) / rel
+    start = time.time()
+    md_path = get_md_path(rel, md_store)
 
-    # Check if MD already exists (from previous partial run)
-    md_name = Path(rel).stem + ".md"
-    md_path = md_store / md_name
+    # Check if MD already exists
     if md_path.exists() and md_path.stat().st_size > SMALL_FILE_THRESHOLD:
         return {"status": "done", "md_size": md_path.stat().st_size,
                 "duration_s": 0, "error": None, "already_exists": True}
 
-    for attempt in range(MAX_RETRIES):
-        start = time.time()
+    if not staged_path or not staged_path.exists():
+        return {"status": "error", "md_size": 0,
+                "duration_s": time.time() - start, "error": "Staging failed"}
 
-        # Ensure file is downloaded locally
-        if not ensure_local(str(full_path)):
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAYS[attempt])
-                continue
-            return {"status": "error", "md_size": 0,
-                    "duration_s": time.time() - start, "error": "Download timeout"}
+    # Convert from staging
+    result = convert_file(staged_path, md_path, ext)
+    result["duration_s"] = round(time.time() - start, 2)
 
-        # Convert
-        result = convert_file(full_path, md_store, ext)
-        result["duration_s"] = round(time.time() - start, 2)
-
-        if result["status"] == "done":
-            # Free OneDrive space after successful conversion
-            if FREE_SPACE_AFTER_CONVERT:
-                free_onedrive_space(str(full_path))
-            return result
-
-        # Failed — retry if attempts remain
-        if attempt < MAX_RETRIES - 1:
-            log.warning(f"  Retrying {Path(rel).name} "
-                        f"(attempt {attempt + 2}/{MAX_RETRIES})…")
-            time.sleep(RETRY_DELAYS[attempt])
-
-    # All retries exhausted
-    return result  # Last failure
+    return result
 
 # =============================================================================
 # PROGRESS REPORTING
@@ -401,7 +427,6 @@ def print_status(conn: sqlite3.Connection):
     total_files = sum(r[1] for r in stats)
     total_size = sum(r[2] for r in stats)
 
-    # Format breakdown
     by_ext = conn.execute("""
         SELECT ext, status, COUNT(*)
         FROM files GROUP BY ext, status ORDER BY ext, status
@@ -412,6 +437,7 @@ def print_status(conn: sqlite3.Connection):
     print(f"{'='*60}")
     print(f"Source: {ONEDRIVE_ROOT}")
     print(f"Output: {MD_STORE}")
+    print(f"Staging: {STAGE_DIR}")
     print(f"{'='*60}")
 
     for status, count, size in stats:
@@ -422,7 +448,6 @@ def print_status(conn: sqlite3.Connection):
     print(f"  {'TOTAL':12s}: {total_files:>7,} files — {total_size / (1024**3):,.2f} GB")
     print(f"{'='*60}")
 
-    # By extension
     print("\nBy format:")
     current_ext = None
     for ext, status, count in by_ext:
@@ -476,12 +501,34 @@ def print_summary(start_time: float, total: int, converted: int,
         print(f"Run with --retry-failed to re-attempt.")
 
 # =============================================================================
+# PRE-FETCH STAGING
+# =============================================================================
+
+def stage_batch(chunk: list[tuple[str, str, int]], executor: ThreadPoolExecutor,
+                staged: dict) -> None:
+    """
+    Download and stage multiple files in parallel.
+    Fills `staged` dict with {rel_path: staged_path_or_None}.
+    """
+    futures = {}
+    for rel, ext, size in chunk:
+        if rel not in staged:
+            futures[executor.submit(stage_file, rel)] = rel
+
+    for future in as_completed(futures):
+        rel = futures[future]
+        try:
+            staged[rel] = future.result(timeout=300)
+        except Exception:
+            staged[rel] = None
+
+# =============================================================================
 # MAIN PIPELINE
 # =============================================================================
 
 def run_pipeline(test_mode: bool = False, retry_failed: bool = False,
                  scan_only: bool = False):
-    """Main pipeline loop."""
+    """Main pipeline loop with pre-fetch staging."""
     conn = init_db(PROGRESS_DB)
     mode = "test" if test_mode else "full"
     start_time = time.time()
@@ -490,6 +537,8 @@ def run_pipeline(test_mode: bool = False, retry_failed: bool = False,
     log.info(f"PIPELINE START — mode={mode}")
     log.info(f"Source: {ONEDRIVE_ROOT}")
     log.info(f"Output: {MD_STORE}")
+    log.info(f"Staging: {STAGE_DIR}")
+    log.info(f"Download ahead: {DOWNLOAD_AHEAD} files")
     log.info(f"{'='*60}")
 
     # Phase 1: SCAN
@@ -503,7 +552,7 @@ def run_pipeline(test_mode: bool = False, retry_failed: bool = False,
 
         queued = queue_new_files(conn, files)
         log.info(f"Queued {queued:,} new/changed files")
-        del files  # Free memory
+        del files
         gc.collect()
 
     if scan_only:
@@ -511,7 +560,7 @@ def run_pipeline(test_mode: bool = False, retry_failed: bool = False,
         conn.close()
         return
 
-    # Phase 2: CHECK HYBRID SERVER (for PDFs)
+    # Phase 2: CHECK HYBRID SERVER
     has_pdfs = conn.execute(
         "SELECT COUNT(*) FROM files WHERE ext='.pdf' AND status='pending'"
     ).fetchone()[0] > 0
@@ -530,15 +579,17 @@ def run_pipeline(test_mode: bool = False, retry_failed: bool = False,
     if has_pdfs:
         log.info("Hybrid server detected ✓")
 
-    # Get pending files with sizes
+    # Phase 3: GET PENDING FILES
     if retry_failed:
         pending = conn.execute(
-            "SELECT rel_path, ext, size_bytes FROM files WHERE status IN ('error', 'missing', 'tiny')"
+            "SELECT rel_path, ext, size_bytes FROM files "
+            "WHERE status IN ('error', 'missing', 'tiny')"
         ).fetchall()
         log.info(f"Retrying {len(pending):,} failed files")
     else:
         pending = conn.execute(
-            "SELECT rel_path, ext, size_bytes FROM files WHERE status='pending' ORDER BY rel_path"
+            "SELECT rel_path, ext, size_bytes FROM files "
+            "WHERE status='pending' ORDER BY rel_path"
         ).fetchall()
 
     if not pending:
@@ -547,45 +598,72 @@ def run_pipeline(test_mode: bool = False, retry_failed: bool = False,
         conn.close()
         return
 
-    # Apply test batch limit
     if test_mode and len(pending) > TEST_BATCH_SIZE:
         log.info(f"TEST MODE: limiting to first {TEST_BATCH_SIZE} files")
         pending = pending[:TEST_BATCH_SIZE]
 
-    # Stats
     pending_total_size = sum(r[2] for r in pending)
     log.info(f"To convert: {len(pending):,} files ({pending_total_size / (1024**3):.2f} GB)")
     log.info(f"{'='*60}")
 
-    # Phase 4: CONVERT
+    # Phase 4: CONVERT (with pre-fetch staging)
+    STAGE_DIR.mkdir(parents=True, exist_ok=True)
     MD_STORE.mkdir(parents=True, exist_ok=True)
+
     converted = 0
     skipped = 0
     failed = 0
     total_bytes = 0
 
-    # Process in chunks with ThreadPoolExecutor for I/O parallelism
-    chunk_size = min(BATCH_SIZE, len(pending))
-    for chunk_start in range(0, len(pending), chunk_size):
-        chunk = pending[chunk_start:chunk_start + chunk_size]
-        chunk_num = (chunk_start // chunk_size) + 1
-        total_chunks = (len(pending) + chunk_size - 1) // chunk_size
-        log.info(f"Batch {chunk_num}/{total_chunks} ({len(chunk)} files)")
+    # Process in chunks
+    for chunk_start in range(0, len(pending), BATCH_SIZE):
+        chunk = pending[chunk_start:chunk_start + BATCH_SIZE]
+        chunk_num = (chunk_start // BATCH_SIZE) + 1
+        total_chunks = (len(pending) + BATCH_SIZE - 1) // BATCH_SIZE
 
-        # Process chunk with thread pool (I/O bound: OneDrive downloads)
+        log.info(f"Batch {chunk_num}/{total_chunks} "
+                 f"({len(chunk)} files — staging {DOWNLOAD_AHEAD} ahead)")
+
+        staged: dict[str, Path | None] = {}
+
         with ThreadPoolExecutor(max_workers=IO_WORKERS) as executor:
-            futures = {}
-            for rel, ext, file_size in chunk:
-                future = executor.submit(process_single_file, rel, ext, file_size, MD_STORE)
-                futures[future] = (rel, ext, file_size)
+            # Pre-stage first DOWNLOAD_AHEAD files
+            prefetch_batch = chunk[:DOWNLOAD_AHEAD]
+            stage_batch(prefetch_batch, executor, staged)
 
-            for i, future in enumerate(as_completed(futures), 1):
-                rel, ext, file_size = futures[future]
-                try:
-                    result = future.result(timeout=300)
-                except Exception as e:
-                    result = {"status": "error", "md_size": 0, "duration_s": 0,
-                              "error": str(e)[:500]}
+            # Process files
+            for i, (rel, ext, file_size) in enumerate(chunk):
+                # Ensure current file is staged
+                if rel not in staged:
+                    # Stage just this one (should only happen for last few files)
+                    stage_batch([(rel, ext, file_size)], executor, staged)
+
+                # Submit staging for file DOWNLOAD_AHEAD positions ahead
+                ahead_idx = i + DOWNLOAD_AHEAD
+                if ahead_idx < len(chunk):
+                    ahead_rel = chunk[ahead_idx][0]
+                    if ahead_rel not in staged:
+                        stage_batch(
+                            [(chunk[ahead_idx][0], chunk[ahead_idx][1], chunk[ahead_idx][2])],
+                            executor, staged
+                        )
+
+                # Convert from staging (already downloaded)
+                staged_path = staged.get(rel)
+                result = process_single_file(rel, ext, file_size, staged_path, MD_STORE)
+
+                # If staging failed, retry with backoff
+                if result.get("error") == "Staging failed":
+                    for attempt in range(MAX_RETRIES - 1):
+                        time.sleep(RETRY_DELAYS[attempt])
+                        log.info(f"  Retrying stage: {Path(rel).name} "
+                                 f"(attempt {attempt + 2}/{MAX_RETRIES})")
+                        staged_path = stage_file(rel)
+                        if staged_path:
+                            staged[rel] = staged_path
+                            result = process_single_file(rel, ext, file_size, staged_path, MD_STORE)
+                            if result["status"] == "done":
+                                break
 
                 # Update database
                 conn.execute(
@@ -611,17 +689,24 @@ def run_pipeline(test_mode: bool = False, retry_failed: bool = False,
                         (rel,)
                     )
 
-                # Progress update every 10 files
-                if i % 10 == 0 or i == len(chunk):
-                    log.info(f"  [{i}/{len(chunk)}] "
+                # Progress update
+                if (i + 1) % 10 == 0 or i == len(chunk) - 1:
+                    log.info(f"  [{i + 1}/{len(chunk)}] "
                              f"ok={converted} skip={skipped} fail={failed}")
 
-            conn.commit()
+        conn.commit()
 
-        # Memory cleanup between chunks
+        # Cleanup staging after each chunk
+        for p in staged.values():
+            if p and p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
         gc.collect()
 
-    # Phase 5: RSYNC (if configured)
+    # Phase 5: RSYNC
     if RSYNC_TARGET and total_bytes > 0:
         log.info(f"Syncing to {RSYNC_TARGET}...")
         try:
@@ -633,7 +718,13 @@ def run_pipeline(test_mode: bool = False, retry_failed: bool = False,
         except Exception as e:
             log.error(f"rsync failed: {e}")
 
-    # Phase 6: SUMMARY
+    # Phase 6: CLEANUP EMPTY STAGING
+    try:
+        shutil.rmtree(STAGE_DIR, ignore_errors=True)
+    except Exception:
+        pass
+
+    # Phase 7: SUMMARY
     total = converted + skipped + failed
     print_summary(start_time, total, converted, skipped, failed, total_bytes)
     print_status(conn)
