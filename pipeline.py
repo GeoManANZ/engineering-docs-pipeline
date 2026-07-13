@@ -91,6 +91,30 @@ ALL_EXTENSIONS = PDF_EXTENSIONS | OFFICE_EXTENSIONS
 ATTRIB_EXE = "/mnt/c/Windows/system32/attrib.exe"
 
 # =============================================================================
+# STARTUP CHECK — Fail fast if venv not activated
+# =============================================================================
+
+_VENV_DIR = Path.home() / "pdf-convert-venv"
+_VENV_SITE_PACKAGES = _VENV_DIR / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+if _VENV_SITE_PACKAGES.exists() and _VENV_SITE_PACKAGES not in Path(sys.executable).parts:
+    # Check if we're running outside the venv
+    if str(_VENV_SITE_PACKAGES) not in sys.path:
+        _venv_python = str(_VENV_DIR / "bin" / "python3")
+        print(f"\n{'='*60}")
+        print("❌ WRONG PYTHON — You're not running inside the venv!")
+        print(f"{'='*60}")
+        print(f"Current:  {sys.executable}")
+        print(f"Use this: {_venv_python}")
+        print(f"{'='*60}")
+        print(f"\nRun these commands first:")
+        print(f"  cd ~/pdf-convert-venv && source bin/activate")
+        print(f"  cd ~/engineering-docs-pipeline && python3 pipeline.py --test")
+        print()
+        sys.exit(1)
+
+del _VENV_DIR, _VENV_SITE_PACKAGES
+
+# =============================================================================
 # LOGGING
 # =============================================================================
 
