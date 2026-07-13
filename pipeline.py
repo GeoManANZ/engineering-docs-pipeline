@@ -61,6 +61,9 @@ TEST_BATCH_SIZE = 50
 MAX_RETRIES = 3
 RETRY_DELAYS = [2, 8, 30]  # exponential backoff in seconds
 
+# Minimum output file size (bytes) — anything smaller is a failed conversion
+SMALL_FILE_THRESHOLD = 100
+
 # rsync target (set to empty string to skip)
 RSYNC_TARGET = ""
 
@@ -132,19 +135,6 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_status ON files(status)
     """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS runs (
-            run_id      INTEGER PRIMARY KEY AUTOINCREMENT,
-            started_at  TEXT,
-            finished_at TEXT,
-            mode        TEXT,
-            total       INTEGER DEFAULT 0,
-            converted   INTEGER DEFAULT 0,
-            skipped     INTEGER DEFAULT 0,
-            failed      INTEGER DEFAULT 0,
-            freed_bytes INTEGER DEFAULT 0
-        )
-    """)
     conn.commit()
     return conn
 
@@ -171,26 +161,27 @@ def free_onedrive_space(path: str):
 def ensure_local(path: str, timeout: int = 120) -> bool:
     """
     Ensure a OneDrive file is downloaded locally.
-    Triggers download by reading the file, waits for it to materialize.
-    Returns True if file is accessible.
+    Cloud-only placeholders may report a fake file size on WSL2, so we always
+    attempt to read the actual bytes. OneDrive downloads on access.
+    Returns True once we can read real data.
     """
-    if os.path.exists(path) and os.path.getsize(path) > 0:
-        return True
-
-    # File is cloud-only — trigger download by attempting to open it
-    log.info(f"  Downloading from OneDrive: {os.path.basename(path)}")
     start = time.time()
+    first_attempt = True
     while time.time() - start < timeout:
         try:
             with open(path, "rb") as f:
-                f.read(1)  # Triggers download
-            if os.path.getsize(path) > 0:
+                data = f.read(4096)  # Enough to trigger full download
+            if data and data != b"\x00" * len(data):
                 return True
         except (OSError, IOError):
             pass
-        time.sleep(2)
 
-    log.warning(f"  Download timeout ({timeout}s): {path}")
+        if first_attempt:
+            log.info(f"  Waiting for OneDrive: {os.path.basename(path)}")
+            first_attempt = False
+        time.sleep(3)
+
+    log.warning(f"  Download timeout ({timeout}s): {os.path.basename(path)}")
     return False
 
 # =============================================================================
@@ -294,7 +285,7 @@ def convert_pdf(pdf_path: Path, output_dir: Path) -> dict:
         md_path = output_dir / (pdf_path.stem + ".md")
         if md_path.exists():
             result["md_size"] = md_path.stat().st_size
-            if result["md_size"] < 100:
+            if result["md_size"] < SMALL_FILE_THRESHOLD:
                 result["status"] = "tiny"
                 result["error"] = f"Output only {result['md_size']}B"
         else:
@@ -350,32 +341,47 @@ def convert_file(file_path: Path, output_dir: Path, ext: str) -> dict:
 def process_single_file(rel: str, ext: str, file_size: int, md_store: Path) -> dict:
     """
     Process a single file: ensure local → convert → free space.
+    Retries up to MAX_RETRIES on failure with exponential backoff.
     Returns result dict with status, md_size, duration_s, error.
     """
     full_path = Path(ONEDRIVE_ROOT) / rel
-    start = time.time()
 
     # Check if MD already exists (from previous partial run)
     md_name = Path(rel).stem + ".md"
     md_path = md_store / md_name
-    if md_path.exists() and md_path.stat().st_size > 100:
+    if md_path.exists() and md_path.stat().st_size > SMALL_FILE_THRESHOLD:
         return {"status": "done", "md_size": md_path.stat().st_size,
                 "duration_s": 0, "error": None, "already_exists": True}
 
-    # Ensure file is downloaded locally
-    if not ensure_local(str(full_path)):
-        return {"status": "error", "md_size": 0,
-                "duration_s": time.time() - start, "error": "Download timeout"}
+    for attempt in range(MAX_RETRIES):
+        start = time.time()
 
-    # Convert
-    result = convert_file(full_path, md_store, ext)
+        # Ensure file is downloaded locally
+        if not ensure_local(str(full_path)):
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAYS[attempt])
+                continue
+            return {"status": "error", "md_size": 0,
+                    "duration_s": time.time() - start, "error": "Download timeout"}
 
-    # Free OneDrive space after successful conversion
-    if result["status"] == "done" and FREE_SPACE_AFTER_CONVERT:
-        free_onedrive_space(str(full_path))
+        # Convert
+        result = convert_file(full_path, md_store, ext)
+        result["duration_s"] = round(time.time() - start, 2)
 
-    result["duration_s"] = round(time.time() - start, 2)
-    return result
+        if result["status"] == "done":
+            # Free OneDrive space after successful conversion
+            if FREE_SPACE_AFTER_CONVERT:
+                free_onedrive_space(str(full_path))
+            return result
+
+        # Failed — retry if attempts remain
+        if attempt < MAX_RETRIES - 1:
+            log.warning(f"  Retrying {Path(rel).name} "
+                        f"(attempt {attempt + 2}/{MAX_RETRIES})…")
+            time.sleep(RETRY_DELAYS[attempt])
+
+    # All retries exhausted
+    return result  # Last failure
 
 # =============================================================================
 # PROGRESS REPORTING
