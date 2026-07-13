@@ -217,7 +217,9 @@ def scan_files(root: str) -> list[tuple[str, int, float, str]]:
         return results
 
     log.info(f"Scanning {root}...")
+    log.info("  (First scan of 154GB OneDrive may take 5-15 min. Progress every 1,000 files.)")
     count = 0
+    scan_start = time.time()
     for dirpath, _, filenames in os.walk(root_path):
         for fname in filenames:
             ext = Path(fname).suffix.lower()
@@ -228,12 +230,17 @@ def scan_files(root: str) -> list[tuple[str, int, float, str]]:
                 st = full.stat()
                 results.append((str(full.relative_to(root_path)), st.st_size, st.st_mtime, ext))
                 count += 1
-                if count % 10000 == 0:
-                    log.info(f"  Scanned {count:,} files...")
+                if count % 1000 == 0:
+                    elapsed = time.time() - scan_start
+                    rate = count / elapsed if elapsed > 0 else 0
+                    log.info(f"  Scanned {count:,} files ({rate:.0f} f/s)...")
             except OSError:
                 continue
 
-    log.info(f"Scan complete: {count:,} files ({sum(r[1] for r in results) / (1024**3):.1f} GB)")
+    elapsed = time.time() - scan_start
+    total_gb = sum(r[1] for r in results) / (1024**3)
+    log.info(f"Scan complete: {count:,} files ({total_gb:.1f} GB) in {elapsed:.0f}s "
+             f"({count/elapsed:.0f} f/s)")
     return results
 
 def queue_new_files(conn: sqlite3.Connection, files: list[tuple[str, int, float, str]]) -> int:
