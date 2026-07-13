@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Engineering Docs Pipeline v4 — Multi-format PDF/DOCX/XLSX → Markdown
-=====================================================================
+Engineering Docs Pipeline v5 — PDF + DOCX → Markdown
+======================================================
 Self-contained, self-logging, resume-safe converter for engineering documents.
-Runs on G14 WSL2 with GPU-accelerated OCR for PDFs, MarkItDown for Office files.
+Runs on G14 WSL2 with GPU-accelerated OCR for PDFs, MarkItDown for Word files.
 
-Key features:
-- Async pre-fetch: stages DOWNLOAD_AHEAD files concurrently, never blocks conversion
-- Folder structure preserved: Subfolder/report.pdf → Subfolder/report.md
-- Live progress: per-file status, ETA, throughput, staging queue depth
-- Retry: download AND conversion failures retried with exponential backoff
+- Skips .xlsx (no value in converting spreadsheets to MD)
+- When .docx and .pdf share same folder+name, keeps .docx only
+- No picture/image extraction — refer to originals for accuracy
 
 Usage:
     python3 pipeline.py --test              # Test batch: 50 files, then stop
@@ -84,7 +82,7 @@ FREE_SPACE_AFTER_STAGING = True
 
 # File extensions
 PDF_EXTENSIONS = {".pdf"}
-OFFICE_EXTENSIONS = {".docx", ".xlsx"}
+OFFICE_EXTENSIONS = {".docx"}   # Word only — no Excel
 ALL_EXTENSIONS = PDF_EXTENSIONS | OFFICE_EXTENSIONS
 
 # attrib.exe path for OneDrive space management
@@ -268,8 +266,21 @@ def scan_files(root: str) -> list[tuple[str, int, float, str]]:
     return results
 
 def queue_new_files(conn: sqlite3.Connection, files: list[tuple[str, int, float, str]]) -> int:
-    queued = 0
+    """Add new/changed files. When .docx and .pdf share a stem+parent, keep .docx only."""
+    # Build lookup: (parent_dir, stem) → preferred extension
+    prefer: dict[tuple[str, str], tuple[str, int, float, str]] = {}
     for rel, size, mtime, ext in files:
+        key = (str(Path(rel).parent), Path(rel).stem)
+        existing = prefer.get(key)
+        if existing is None:
+            prefer[key] = (rel, size, mtime, ext)
+        else:
+            # .docx beats .pdf
+            if ext == ".docx" and existing[3] == ".pdf":
+                prefer[key] = (rel, size, mtime, ext)
+
+    queued = 0
+    for rel, size, mtime, ext in prefer.values():
         existing = conn.execute(
             "SELECT mtime, size_bytes, status FROM files WHERE rel_path=?", (rel,)
         ).fetchone()
@@ -354,7 +365,7 @@ def convert_office(file_path: Path, output_path: Path) -> dict:
 def convert_file(file_path: Path, output_path: Path, ext: str) -> dict:
     if ext == ".pdf":
         return convert_pdf(file_path, output_path)
-    elif ext in {".docx", ".xlsx"}:
+    elif ext == ".docx":
         return convert_office(file_path, output_path)
     return {"status": "skipped", "md_size": 0, "error": f"Unsupported: {ext}"}
 
@@ -629,7 +640,7 @@ def run_pipeline(test_mode: bool = False, retry_failed: bool = False,
         log.error(f"  cd ~/pdf-convert-venv && source bin/activate")
         log.error(f"  opendataloader-pdf-hybrid --port {HYBRID_PORT} \\")
         log.error(f"    --force-ocr --ocr-engine rapidocr --device cuda \\")
-        log.error(f"    --enrich-formula --enrich-picture-description")
+        log.error(f"    --enrich-formula")
         sys.exit(1)
 
     if has_pdfs:
