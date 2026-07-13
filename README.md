@@ -16,6 +16,8 @@ Multi-format document converter for engineering libraries. Converts PDF, DOCX, a
 - Incremental processing (only new/changed files)
 - Resume-safe (SQLite tracking, survives crashes)
 
+**Note:** Only `.pdf`, `.docx`, and `.xlsx` are supported. Legacy formats (`.doc`, `.xls`, `.ppt`) are skipped. Convert those manually first if needed.
+
 ## Prerequisites
 
 - G14 laptop with WSL2 (Ubuntu)

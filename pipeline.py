@@ -17,10 +17,8 @@ Usage:
 
 import argparse
 import gc
-import hashlib
 import logging
 import os
-import signal
 import sqlite3
 import subprocess
 import sys
@@ -154,16 +152,6 @@ def init_db(db_path: Path) -> sqlite3.Connection:
 # ONEDRIVE SPACE MANAGEMENT
 # =============================================================================
 
-def is_cloud_only(path: str) -> bool:
-    """Check if a OneDrive file is cloud-only (not downloaded locally)."""
-    try:
-        st = os.stat(path)
-        # Cloud-only files often show as 0 bytes or very small
-        # The reliable method is checking attrib.exe output
-        return False  # If stat works, file is accessible
-    except OSError:
-        return True
-
 def free_onedrive_space(path: str):
     """Mark a file as online-only (free local disk space)."""
     if not FREE_SPACE_AFTER_CONVERT:
@@ -212,7 +200,7 @@ def ensure_local(path: str, timeout: int = 120) -> bool:
 def scan_files(root: str) -> list[tuple[str, int, float, str]]:
     """
     Walk the source folder and return (rel_path, size, mtime, ext) for all
-    supported files. Generator-based for memory efficiency.
+    supported files (.pdf, .docx, .xlsx).
     """
     results = []
     root_path = Path(root)
@@ -359,10 +347,10 @@ def convert_file(file_path: Path, output_dir: Path, ext: str) -> dict:
 # FILE PROCESSING (with retry + free space)
 # =============================================================================
 
-def process_single_file(rel: str, ext: str, conn: sqlite3.Connection, md_store: Path) -> dict:
+def process_single_file(rel: str, ext: str, file_size: int, md_store: Path) -> dict:
     """
     Process a single file: ensure local → convert → free space.
-    Returns result dict.
+    Returns result dict with status, md_size, duration_s, error.
     """
     full_path = Path(ONEDRIVE_ROOT) / rel
     start = time.time()
@@ -536,15 +524,15 @@ def run_pipeline(test_mode: bool = False, retry_failed: bool = False,
     if has_pdfs:
         log.info("Hybrid server detected ✓")
 
-    # Phase 3: GET PENDING FILES
+    # Get pending files with sizes
     if retry_failed:
         pending = conn.execute(
-            "SELECT rel_path, ext FROM files WHERE status IN ('error', 'missing', 'tiny')"
+            "SELECT rel_path, ext, size_bytes FROM files WHERE status IN ('error', 'missing', 'tiny')"
         ).fetchall()
         log.info(f"Retrying {len(pending):,} failed files")
     else:
         pending = conn.execute(
-            "SELECT rel_path, ext FROM files WHERE status='pending' ORDER BY rel_path"
+            "SELECT rel_path, ext, size_bytes FROM files WHERE status='pending' ORDER BY rel_path"
         ).fetchall()
 
     if not pending:
@@ -559,10 +547,8 @@ def run_pipeline(test_mode: bool = False, retry_failed: bool = False,
         pending = pending[:TEST_BATCH_SIZE]
 
     # Stats
-    pending_sizes = conn.execute(
-        "SELECT COALESCE(SUM(size_bytes), 0) FROM files WHERE status='pending'"
-    ).fetchone()[0]
-    log.info(f"To convert: {len(pending):,} files ({pending_sizes / (1024**3):.2f} GB)")
+    pending_total_size = sum(r[2] for r in pending)
+    log.info(f"To convert: {len(pending):,} files ({pending_total_size / (1024**3):.2f} GB)")
     log.info(f"{'='*60}")
 
     # Phase 4: CONVERT
@@ -583,12 +569,12 @@ def run_pipeline(test_mode: bool = False, retry_failed: bool = False,
         # Process chunk with thread pool (I/O bound: OneDrive downloads)
         with ThreadPoolExecutor(max_workers=IO_WORKERS) as executor:
             futures = {}
-            for rel, ext in chunk:
-                future = executor.submit(process_single_file, rel, ext, conn, MD_STORE)
-                futures[future] = (rel, ext)
+            for rel, ext, file_size in chunk:
+                future = executor.submit(process_single_file, rel, ext, file_size, MD_STORE)
+                futures[future] = (rel, ext, file_size)
 
             for i, future in enumerate(as_completed(futures), 1):
-                rel, ext = futures[future]
+                rel, ext, file_size = futures[future]
                 try:
                     result = future.result(timeout=300)
                 except Exception as e:
@@ -609,14 +595,11 @@ def run_pipeline(test_mode: bool = False, retry_failed: bool = False,
                         skipped += 1
                     else:
                         converted += 1
-                        total_bytes += conn.execute(
-                            "SELECT size_bytes FROM files WHERE rel_path=?", (rel,)
-                        ).fetchone()[0]
+                        total_bytes += file_size
                 elif result["status"] == "skipped":
                     skipped += 1
                 else:
                     failed += 1
-                    # Increment retry count
                     conn.execute(
                         "UPDATE files SET retry_count=retry_count+1 WHERE rel_path=?",
                         (rel,)
