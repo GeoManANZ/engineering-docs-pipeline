@@ -325,9 +325,8 @@ def convert_pdfs_batch(staged_pdfs: list[tuple[str, Path, Path, str]],
 
     for url, group in by_server.items():
         input_paths = [str(staged) for _, staged, _ in group]
-        # Determine output dir — use a common parent or individual parents
-        # opendataloader expects all outputs in one dir. We'll use a temp dir
-        # and then move files to their proper folder-structure locations.
+        # Use hybrid_mode='full' for scanned server (port 5003), 'auto' for digital
+        use_mode = "full" if str(HYBRID_SCANNED_PORT) in url else "auto"
         batch_output = STAGE_DIR / f"_batch_out_{int(time.time()*1000)}"
         batch_output.mkdir(parents=True, exist_ok=True)
 
@@ -335,7 +334,7 @@ def convert_pdfs_batch(staged_pdfs: list[tuple[str, Path, Path, str]],
             odl_convert(
                 input_path=input_paths, output_dir=str(batch_output),
                 format="markdown", hybrid="docling-fast",
-                hybrid_mode="auto",   # default — overridden per-group below
+                hybrid_mode=use_mode,
                 hybrid_url=url, quiet=True,
             )
 
