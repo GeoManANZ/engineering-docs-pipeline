@@ -71,7 +71,8 @@ HYBRID_SCANNED_PORT = 5003
 # ── Tuned batch sizes ──
 IO_WORKERS      = 6     # Parallel staging threads (was 4)
 DOWNLOAD_AHEAD  = 25    # Files pre-fetched before conversion starts (was 10)
-PDF_BATCH       = 100   # PDFs per opendataloader call (was 1!)
+PDF_BATCH       = 0     # REMOVED — batch convert was slower (hybrid server serializes)
+
 BATCH_SIZE      = 150   # Files per outer chunk (was 50)
 TEST_BATCH_SIZE = 50
 MAX_RETRIES     = 3
@@ -298,71 +299,17 @@ def is_calc_document(rel: str) -> bool:
     return bool(_calc_re.search(rel))
 
 # =============================================================================
-# CONVERTERS — BATCH OPTIMIZED
+# CONVERTERS — Per-file parallel (not batch — hybrid server serializes batches)
 # =============================================================================
+# v6's batch convert() was 3x SLOWER than per-file because the hybrid server
+# processes input_path serially, blocking the entire call. Reverting to
+# per-file with ThreadPoolExecutor for true parallelism (4-6 concurrent calls).
 
-# ── CHANGE 1: Batch PDF conversion ──
-def convert_pdfs_batch(staged_pdfs: list[tuple[str, Path, Path, str]],
-                       output_store: Path) -> dict[str, dict]:
-    """
-    Convert multiple PDFs in ONE opendataloader_pdf.convert() call.
-    staged_pdfs: list of (rel_path, staged_file_path, expected_md_path, hybrid_url)
-    Returns dict: {rel_path: {status, md_size, error}}
-    """
-    if not staged_pdfs:
-        return {}
+_CONVERT_WORKERS = 4  # Parallel conversion threads per server
 
-    results: dict[str, dict] = {}
-    if odl_convert is None:
-        for rel, staged, md_path, url in staged_pdfs:
-            results[rel] = {"status":"error","md_size":0,"error":"opendataloader_pdf not installed"}
-        return results
-
-    # Group by hybrid_url since all files in one batch must use the same server
-    by_server: dict[str, list[tuple[str, Path, Path]]] = {}
-    for rel, staged, md_path, url in staged_pdfs:
-        by_server.setdefault(url, []).append((rel, staged, md_path))
-
-    for url, group in by_server.items():
-        input_paths = [str(staged) for _, staged, _ in group]
-        # Use hybrid_mode='full' for scanned server (port 5003), 'auto' for digital
-        use_mode = "full" if str(HYBRID_SCANNED_PORT) in url else "auto"
-        batch_output = STAGE_DIR / f"_batch_out_{int(time.time()*1000)}"
-        batch_output.mkdir(parents=True, exist_ok=True)
-
-        try:
-            odl_convert(
-                input_path=input_paths, output_dir=str(batch_output),
-                format="markdown", hybrid="docling-fast",
-                hybrid_mode=use_mode,
-                hybrid_url=url, quiet=True,
-            )
-
-            # Check each expected output
-            for rel, staged, md_path in group:
-                # opendataloader puts files in the output dir using stem names
-                expected_name = Path(rel).stem + ".md"
-                generated = batch_output / expected_name
-                if generated.exists() and generated.stat().st_size > SMALL_FILE_THRESHOLD:
-                    # Move to correct folder-structure location
-                    md_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(generated), str(md_path))
-                    results[rel] = {"status":"done","md_size":md_path.stat().st_size,"error":None}
-                else:
-                    results[rel] = {"status":"missing","md_size":0,"error":"No .md produced"}
-        except Exception as e:
-            for rel, staged, md_path in group:
-                results[rel] = {"status":"error","md_size":0,"error":str(e)[:500]}
-        finally:
-            try: shutil.rmtree(batch_output, ignore_errors=True)
-            except Exception: pass
-
-    return results
-
-# ── Single-PDF fallback (for groups of 1 that need specific settings) ──
-def convert_pdf_single(staged_path: Path, md_path: Path, hybrid_url: str,
-                       hybrid_mode: str = "auto") -> dict:
-    """Convert a single PDF with specific hybrid_mode (e.g., 'full' for calcs)."""
+def convert_pdf(staged_path: Path, md_path: Path, hybrid_url: str,
+                hybrid_mode: str = "auto") -> dict:
+    """Convert one PDF via the appropriate hybrid server (digital or scanned)."""
     if odl_convert is None:
         return {"status":"error","md_size":0,"error":"opendataloader_pdf not installed"}
     try:
@@ -528,7 +475,7 @@ def run_pipeline(test_mode=False, retry_failed=False, scan_only=False):
     log.info(f"PIPELINE v6 START — mode={mode}")
     log.info(f"Source:  {ONEDRIVE_ROOT}")
     log.info(f"Output:  {MD_STORE}")
-    log.info(f"Config:  IO_WORKERS={IO_WORKERS} DOWNLOAD_AHEAD={DOWNLOAD_AHEAD} PDF_BATCH={PDF_BATCH} BATCH_SIZE={BATCH_SIZE}")
+    log.info(f"Config:  IO_WORKERS={IO_WORKERS} DOWNLOAD_AHEAD={DOWNLOAD_AHEAD} CONVERT_WORKERS={_CONVERT_WORKERS} BATCH_SIZE={BATCH_SIZE}")
     log.info(f"Servers: digital={HYBRID_DIGITAL_PORT} scanned={HYBRID_SCANNED_PORT}")
     log.info(f"{'='*60}")
 
@@ -623,63 +570,58 @@ def run_pipeline(test_mode=False, retry_failed=False, scan_only=False):
                         failed_files += 1
                         conn.execute("UPDATE files SET status='error',error='Staging failed',retry_count=retry_count+1 WHERE rel_path=?",(rel,))
 
-            # Phase B: Convert in batches — PDFs together, DOCX individually
-            # ── PDFs: classify and batch ──
-            pdfs_batch: list[tuple[str, Path, Path, str]] = []  # (rel,staged,md_path,url)
+            # Phase B: Convert — parallel per-file (not batch)
+            # Build task lists for ThreadPoolExecutor
+            pdf_tasks: list[tuple[str, Path, Path, str, str]] = []  # (rel,staged,md,url,mode)
+            docx_tasks: list[tuple[str, Path, Path]] = []
+
             for rel, ext, sz in chunk:
-                if ext != ".pdf": continue
                 sp = staged.get(rel)
                 if sp is None: continue
                 mp = get_md_path(rel, MD_STORE)
                 if mp.exists() and mp.stat().st_size > SMALL_FILE_THRESHOLD:
                     skipped += 1
-                    conn.execute("UPDATE files SET status='done',md_size=?,finished_at=? WHERE rel_path=?",(mp.stat().st_size, datetime.now().isoformat(), rel))
+                    conn.execute("UPDATE files SET status='done',md_size=?,finished_at=? WHERE rel_path=?",(mp.stat().st_size,datetime.now().isoformat(),rel))
                     continue
+                if ext == ".pdf":
+                    if is_likely_scanned(sp):
+                        url = HYBRID_SCANNED_URL_OVERRIDE if 'HYBRID_SCANNED_URL_OVERRIDE' in dir() else HYBRID_SCANNED_URL
+                        mode = "full"
+                    else:
+                        url = HYBRID_DIGITAL_URL
+                        mode = "full" if is_calc_document(rel) else "auto"
+                    pdf_tasks.append((rel, sp, mp, url, mode))
+                elif ext == ".docx":
+                    docx_tasks.append((rel, sp, mp))
 
-                # Classify: scanned vs digital, calc vs normal
-                if is_likely_scanned(sp):
-                    url = HYBRID_SCANNED_URL_OVERRIDE if 'HYBRID_SCANNED_URL_OVERRIDE' in dir() else HYBRID_SCANNED_URL
-                else:
-                    url = HYBRID_DIGITAL_URL
-                pdfs_batch.append((rel, sp, mp, url))
-
-            # Split PDF batch by server URL (can't mix servers in one call)
-            dig = [(r,s,m,u) for r,s,m,u in pdfs_batch if u==HYBRID_DIGITAL_URL]
-            scn = [(r,s,m,u) for r,s,m,u in pdfs_batch if u!=HYBRID_DIGITAL_URL]
-
-            for pdf_group, label in [(dig, "digital"), (scn, "scanned")]:
-                if not pdf_group: continue
-                log.info(f"  Converting {len(pdf_group)} {label} PDFs in batch...")
-                for j in range(0, len(pdf_group), PDF_BATCH):
-                    sub = pdf_group[j:j+PDF_BATCH]
-                    results = convert_pdfs_batch(sub, MD_STORE)
-                    for rel, sp, mp, url in sub:
-                        r = results.get(rel, {"status":"error","md_size":0,"error":"batch failed"})
+            # Convert PDFs in parallel (4 concurrent per-server calls)
+            if pdf_tasks:
+                log.info(f"  Converting {len(pdf_tasks)} PDFs ({_CONVERT_WORKERS} parallel)...")
+                with ThreadPoolExecutor(max_workers=_CONVERT_WORKERS) as conv_exec:
+                    futures = {}
+                    for rel, sp, mp, url, mode in pdf_tasks:
+                        futures[conv_exec.submit(convert_pdf, sp, mp, url, mode)] = (rel, sz if (sz := size_lookup.get(rel)) else 0)
+                    for future in as_completed(futures):
+                        rel, sz = futures[future]
+                        try: r = future.result(timeout=600)
+                        except: r = {"status":"error","md_size":0,"error":"timeout"}
                         if r["status"] == "done":
-                            converted += 1; total_bytes += size_lookup.get(rel,0)
-                            conn.execute("UPDATE files SET status='done',md_size=?,finished_at=?,duration_s=?,error=NULL WHERE rel_path=?",(r["md_size"],datetime.now().isoformat(),0.1,rel))
+                            converted += 1; total_bytes += sz
+                            conn.execute("UPDATE files SET status='done',md_size=?,finished_at=?,error=NULL WHERE rel_path=?",(r["md_size"],datetime.now().isoformat(),rel))
                         else:
                             failed_files += 1
                             conn.execute("UPDATE files SET status='error',error=?,retry_count=retry_count+1 WHERE rel_path=?",(r.get("error",""),rel))
                         progress.update(converted=converted, skipped=skipped, failed=failed_files,
                                         staging_count=len(staging_futures), chunk_current=chunk_num,
-                                        chunk_done=j+len(sub), chunk_total=len(chunk),
+                                        chunk_done=converted+skipped+failed_files, chunk_total=len(chunk),
                                         last_file=Path(rel).name)
                         progress.draw()
 
-            # ── DOCX: individual conversion ──
-            for rel, ext, sz in chunk:
-                if ext != ".docx": continue
-                sp = staged.get(rel)
-                if sp is None: continue
-                mp = get_md_path(rel, MD_STORE)
-                if mp.exists() and mp.stat().st_size > SMALL_FILE_THRESHOLD:
-                    skipped += 1
-                    conn.execute("UPDATE files SET status='done',md_size=?,finished_at=? WHERE rel_path=?",(mp.stat().st_size, datetime.now().isoformat(), rel))
-                    continue
+            # Convert DOCX (sequential — MarkItDown is CPU-bound, fast)
+            for rel, sp, mp in docx_tasks:
                 r = convert_docx(sp, mp)
                 if r["status"] == "done":
-                    converted += 1; total_bytes += sz
+                    converted += 1; total_bytes += size_lookup.get(rel,0)
                     conn.execute("UPDATE files SET status='done',md_size=?,finished_at=?,error=NULL WHERE rel_path=?",(r["md_size"],datetime.now().isoformat(),rel))
                 else:
                     failed_files += 1
