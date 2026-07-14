@@ -461,17 +461,25 @@ def print_status(conn: sqlite3.Connection):
 
 def list_failed(conn): pass  # unchanged — keeping existing implementation
 
-def print_summary(start_time, converted, skipped, failed, total_bytes, progress):
-    elapsed = time.time()-start_time
+def print_summary(scan_elapsed: float, convert_elapsed: float, converted: int,
+                  skipped: int, failed: int, total_bytes: int):
+    """Print end-of-run summary. scan_elapsed excludes scan time for accurate f/m."""
+    total_elapsed = scan_elapsed + convert_elapsed
     _live_line("")
-    print(f"\n{'='*60}\nRUN COMPLETE — {str(timedelta(seconds=int(elapsed)))}\n{'='*60}")
-    print(f"  Converted       : {converted:,}")
-    print(f"  Skipped         : {skipped:,}")
-    print(f"  Failed          : {failed:,}")
-    print(f"  Data processed  : {total_bytes/(1024**3):,.2f} GB")
-    if converted > 0:
-        avg = elapsed/converted
-        print(f"  Avg time/file   : {avg:.1f}s ({60/avg:.1f} files/min)")
+    print(f"\n{'='*60}")
+    print(f"RUN COMPLETE — {str(timedelta(seconds=int(total_elapsed)))}")
+    if scan_elapsed > 0:
+        print(f"  Scan time            : {scan_elapsed:.0f}s")
+    if convert_elapsed > 0:
+        print(f"  Convert time         : {convert_elapsed:.0f}s")
+    print(f"{'='*60}")
+    print(f"  Converted             : {converted:,}")
+    print(f"  Skipped (existing)    : {skipped:,}")
+    print(f"  Failed                : {failed:,}")
+    print(f"  Data processed        : {total_bytes/(1024**3):,.2f} GB")
+    if converted > 0 and convert_elapsed > 0:
+        avg = convert_elapsed / converted
+        print(f"  Avg time/file         : {avg:.1f}s ({60/avg:.1f} files/min)")
     print(f"{'='*60}")
     if failed: print("\nRun with --failed to see details.")
 
@@ -513,7 +521,9 @@ def _ensure_staged(rel, staged, futures, file_size):
 def run_pipeline(test_mode=False, retry_failed=False, scan_only=False):
     conn = init_db(PROGRESS_DB)
     mode = "test" if test_mode else "full"
-    start_time = time.time()
+    scan_start = time.time()
+    scan_elapsed = 0.0
+    convert_start = 0.0
 
     log.info(f"{'='*60}")
     log.info(f"PIPELINE v6 START — mode={mode}")
@@ -527,11 +537,14 @@ def run_pipeline(test_mode=False, retry_failed=False, scan_only=False):
     if not retry_failed:
         log.info("Phase 1: Scanning...")
         files = scan_files(ONEDRIVE_ROOT)
+        scan_elapsed = time.time() - scan_start
         if not files: log.error("No files found."); conn.close(); return
         queued = queue_new_files(conn, files)
         log.info(f"Queued {queued:,} new/changed files")
         del files; gc.collect()
     if scan_only: print_status(conn); conn.close(); return
+
+    convert_start = time.time()
 
     # ── Phase 2: CHECK SERVERS ──
     has_pdfs = conn.execute("SELECT COUNT(*) FROM files WHERE ext='.pdf' AND status='pending'").fetchone()[0] > 0
@@ -705,7 +718,9 @@ def run_pipeline(test_mode=False, retry_failed=False, scan_only=False):
     try: shutil.rmtree(STAGE_DIR, ignore_errors=True)
     except: pass
 
-    print_summary(start_time, converted, skipped, failed_files, total_bytes, progress)
+    # ── Final summary ──
+    convert_elapsed = time.time() - convert_start if convert_start > 0 else 0.0
+    print_summary(scan_elapsed, convert_elapsed, converted, skipped, failed_files, total_bytes)
     print_status(conn)
     conn.close()
 
