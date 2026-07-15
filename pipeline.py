@@ -502,17 +502,13 @@ def run_pipeline(test_mode=False, retry_failed=False, scan_only=False):
             conn.close(); sys.exit(1)
         log.info(f"Digital server ✓ (port {HYBRID_DIGITAL_PORT})")
 
-        # Check scanned server — only required if we detect scanned PDFs
-        has_scanned = conn.execute(
-            "SELECT COUNT(*) FROM files WHERE ext='.pdf' AND status='pending'").fetchone()[0] > 0
-        if has_scanned and not check_server(HYBRID_SCANNED_PORT):
-            log.warning(f"Scanned server not running on port {HYBRID_SCANNED_PORT}")
-            log.warning("Scanned PDFs will be routed to digital server (slower OCR but works)")
-            HYBRID_SCANNED_URL_OVERRIDE = HYBRID_DIGITAL_URL
+        # Scanned server — optional, falls back to digital
+        scanned_ok = check_server(HYBRID_SCANNED_PORT)
+        if scanned_ok:
+            log.info(f"Scanned server ✓ (port {HYBRID_SCANNED_PORT})")
         else:
-            HYBRID_SCANNED_URL_OVERRIDE = HYBRID_SCANNED_URL
-            if has_scanned:
-                log.info(f"Scanned server ✓ (port {HYBRID_SCANNED_PORT})")
+            log.warning(f"Scanned server not running on port {HYBRID_SCANNED_PORT} — using digital fallback")
+        scanned_url = HYBRID_SCANNED_URL if scanned_ok else HYBRID_DIGITAL_URL
 
     # ── Phase 3: QUEUE ──
     if retry_failed:
@@ -585,7 +581,7 @@ def run_pipeline(test_mode=False, retry_failed=False, scan_only=False):
                     continue
                 if ext == ".pdf":
                     if is_likely_scanned(sp):
-                        url = HYBRID_SCANNED_URL_OVERRIDE if 'HYBRID_SCANNED_URL_OVERRIDE' in dir() else HYBRID_SCANNED_URL
+                        url = scanned_url
                         mode = "full"
                     else:
                         url = HYBRID_DIGITAL_URL
