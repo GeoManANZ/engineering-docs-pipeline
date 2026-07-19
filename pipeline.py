@@ -21,6 +21,7 @@ Usage:
 
 import argparse
 import gc
+import io
 import logging
 import os
 import re
@@ -29,9 +30,15 @@ import sqlite3
 import subprocess
 import sys
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from datetime import datetime, timedelta
 from pathlib import Path
+
+# ── Suppress pypdf noise (it spews xref warnings to stderr) ──
+warnings.filterwarnings("ignore")
+_old_stderr = sys.stderr
+sys.stderr = io.StringIO()  # capture pypdf noise during imports
 
 # ── Top-level imports (no more import-inside-function overhead) ──
 try:
@@ -48,6 +55,10 @@ try:
     import pypdf
 except ImportError:
     pypdf = None
+
+# ── Restore stderr (progress bar uses it) ──
+sys.stderr = _old_stderr
+del _old_stderr
 
 # =============================================================================
 # CONFIGURATION
@@ -282,32 +293,37 @@ def is_likely_scanned(pdf_path: Path, min_chars: int = 80) -> bool:
     If pypdf can extract text → digital. If it can't or crashes → scanned.
     """
     if pypdf is None:
-        return True  # no classifier → assume scanned (safer)
+        return True
     try:
+        # Suppress pypdf console noise during classification
+        _tmp = sys.stderr
+        sys.stderr = io.StringIO()
         reader = pypdf.PdfReader(str(pdf_path), strict=False)
         text = "".join((p.extract_text() or "") for p in reader.pages[:2])
+        sys.stderr = _tmp
         return len(text.strip()) < min_chars
     except Exception:
-        return True  # crash = no text = likely scanned
+        sys.stderr = _tmp
+        return True
 
 def is_broken_pdf(pdf_path: Path) -> tuple[bool, str]:
-    """
-    Quick pre-check: can this PDF be opened at all?
-    Returns (is_broken, reason).
-    Saves time by skipping hopeless files before sending to the hybrid server.
-    """
+    """Quick pre-check: can this PDF be opened? Returns (is_broken, reason)."""
     if pypdf is None:
-        return (False, "")  # can't check, let converter try
+        return (False, "")
     try:
+        _tmp = sys.stderr
+        sys.stderr = io.StringIO()
         reader = pypdf.PdfReader(str(pdf_path), strict=False)
         if reader.is_encrypted:
-            return (True, "Password protected")
-        # Try reading first page to verify structure
+            sys.stderr = _tmp
+            return (True, "Encrypted")
         if len(reader.pages) > 0:
-            _ = reader.pages[0]  # triggers lazy loading
+            _ = reader.pages[0]
+        sys.stderr = _tmp
         return (False, "")
     except Exception as e:
-        return (True, f"Unreadable PDF: {str(e)[:80]}")
+        sys.stderr = _tmp
+        return (True, f"Unreadable: {str(e)[:60]}")
 
 # ── CHANGE 3: Pattern-based calc/design document detection ──
 _calc_re = re.compile("|".join(CALC_PATTERNS), re.IGNORECASE)
@@ -389,19 +405,19 @@ def _live_line(text: str):
     width = shutil.get_terminal_size((120,40)).columns
     sys.stderr.write(f"\r\033[K{text[:width]}")
     sys.stderr.flush()
-
 class Progress:
+    """Tracks live progress with useful per-file info."""
     def __init__(self, total_pending: int, total_chunks: int):
         self.total = total_pending; self.total_chunks = total_chunks
         self.converted = 0; self.skipped = 0; self.failed = 0
-        self.start_time = time.time()
-        self.last_file = ""; self.staging_count = 0
+        self.convert_start = time.time()
+        self.last_file = ""; self.staging_count = 0; self.last_size = ""
         self.chunk_current = 0; self.chunk_total = 0; self.chunk_done = 0
 
     @property
     def done(self): return self.converted + self.skipped + self.failed
     @property
-    def elapsed(self): return time.time() - self.start_time
+    def elapsed(self): return time.time() - self.convert_start
     @property
     def eta(self):
         if self.done == 0: return "--:--"
@@ -411,20 +427,27 @@ class Progress:
     def rate_str(self):
         if self.done == 0: return "--"
         return f"{self.done/(self.elapsed/60):.1f} f/m"
+    @property
+    def pct(self):
+        return self.done/self.total*100 if self.total>0 else 0
 
     def update(self, **kw):
         for k, v in kw.items():
-            if k in ("last_file","staging_count","chunk_current","chunk_done","chunk_total",
-                     "converted","skipped","failed"):
-                setattr(self, k, v)
+            if hasattr(self, k): setattr(self, k, v)
 
     def draw(self):
-        pct = (self.done/self.total*100) if self.total>0 else 0
-        bar = "█"*int(20*self.done/self.total) + "░"*(20-int(20*self.done/self.total)) if self.total>0 else "░"*20
+        bar_w = 20
+        filled = int(bar_w * self.done / self.total) if self.total > 0 else 0
+        bar = "█"*filled + "░"*(bar_w-filled)
         ci = f"chunk {self.chunk_current}/{self.total_chunks} [{self.chunk_done}/{self.chunk_total}]" if self.chunk_total else ""
         fn = self.last_file
-        if len(fn) > 60: fn = "…" + fn[-59:]
-        _live_line(f"[{bar}] {pct:5.1f}% ✓{self.converted} ⏭{self.skipped} ✗{self.failed} ⏱{self.rate_str} ETA {self.eta} ⬇{self.staging_count} {ci} {fn}")
+        if len(fn) > 45: fn = "…" + fn[-44:]
+        sz = f" {self.last_size}" if self.last_size else ""
+        _live_line(
+            f"[{bar}] {self.pct:5.1f}%  ✓{self.converted} ⏭{self.skipped} ✗{self.failed}  "
+            f"⏱{self.rate_str}  ETA {self.eta}  ⬇{self.staging_count}  "
+            f"{ci}  {fn}{sz}"
+        )
 
 # =============================================================================
 # PROGRESS REPORTING
@@ -678,50 +701,54 @@ def run_pipeline(test_mode=False, retry_failed=False, scan_only=False, force_sca
                         futures[conv_exec.submit(convert_pdf, sp, mp, url, mode)] = (rel, sz if (sz := size_lookup.get(rel)) else 0)
                     for future in as_completed(futures):
                         rel, sz = futures[future]
+                        file_start = time.time()
                         try: r = future.result(timeout=600)
                         except: r = {"status":"error","md_size":0,"error":"timeout"}
+                        file_elapsed = time.time() - file_start
+                        fname = Path(rel).name
                         if r["status"] == "done":
                             converted += 1; total_bytes += sz
                             conn.execute("UPDATE files SET status='done',md_size=?,finished_at=?,error=NULL WHERE rel_path=?",(r["md_size"],datetime.now().isoformat(),rel))
+                            log.info(f"  OK  [{_format_size(sz)}] {fname} ({file_elapsed:.1f}s)")
                         else:
                             failed_files += 1
                             err_msg = r.get("error","")
-                            # Permanent errors: skip immediately, no retry
+                            tag = "SKIP" if _is_permanent_error(err_msg) else "FAIL"
+                            log.info(f"  {tag} [{_format_size(sz)}] {fname} — {err_msg[:100]}")
                             if _is_permanent_error(err_msg):
-                                conn.execute(
-                                    "UPDATE files SET status='error',error=?,retry_count=? WHERE rel_path=?",
-                                    (f"SKIPPED: {err_msg[:150]}", MAX_RETRIES, rel))
+                                conn.execute("UPDATE files SET status='error',error=?,retry_count=? WHERE rel_path=?",(f"SKIPPED: {err_msg[:150]}", MAX_RETRIES, rel))
                             else:
-                                conn.execute(
-                                    "UPDATE files SET status='error',error=?,retry_count=retry_count+1 WHERE rel_path=?",
-                                    (err_msg, rel))
+                                conn.execute("UPDATE files SET status='error',error=?,retry_count=retry_count+1 WHERE rel_path=?",(err_msg, rel))
                         progress.update(converted=converted, skipped=skipped, failed=failed_files,
                                         staging_count=len(staging_futures), chunk_current=chunk_num,
                                         chunk_done=converted+skipped+failed_files, chunk_total=len(chunk),
-                                        last_file=Path(rel).name)
+                                        last_file=fname, last_size=_format_size(sz))
                         progress.draw()
 
             # Convert DOCX (sequential — MarkItDown is CPU-bound, fast)
             for rel, sp, mp in docx_tasks:
+                sz = size_lookup.get(rel,0)
+                file_start = time.time()
                 r = convert_docx(sp, mp)
+                file_elapsed = time.time() - file_start
+                fname = Path(rel).name
                 if r["status"] == "done":
-                    converted += 1; total_bytes += size_lookup.get(rel,0)
+                    converted += 1; total_bytes += sz
                     conn.execute("UPDATE files SET status='done',md_size=?,finished_at=?,error=NULL WHERE rel_path=?",(r["md_size"],datetime.now().isoformat(),rel))
+                    log.info(f"  OK  [{_format_size(sz)}] {fname} ({file_elapsed:.1f}s)")
                 else:
                     failed_files += 1
                     err_msg = r.get("error","")
+                    tag = "SKIP" if _is_permanent_error(err_msg) else "FAIL"
+                    log.info(f"  {tag} [{_format_size(sz)}] {fname} — {err_msg[:100]}")
                     if _is_permanent_error(err_msg):
-                        conn.execute(
-                            "UPDATE files SET status='error',error=?,retry_count=? WHERE rel_path=?",
-                            (f"SKIPPED: {err_msg[:150]}", MAX_RETRIES, rel))
+                        conn.execute("UPDATE files SET status='error',error=?,retry_count=? WHERE rel_path=?",(f"SKIPPED: {err_msg[:150]}", MAX_RETRIES, rel))
                     else:
-                        conn.execute(
-                            "UPDATE files SET status='error',error=?,retry_count=retry_count+1 WHERE rel_path=?",
-                            (err_msg, rel))
+                        conn.execute("UPDATE files SET status='error',error=?,retry_count=retry_count+1 WHERE rel_path=?",(err_msg, rel))
                 progress.update(converted=converted, skipped=skipped, failed=failed_files,
                                 staging_count=0, chunk_current=chunk_num,
                                 chunk_done=converted+skipped+failed_files, chunk_total=len(chunk),
-                                last_file=Path(rel).name)
+                                last_file=fname, last_size=_format_size(sz))
                 progress.draw()
 
         conn.commit()
