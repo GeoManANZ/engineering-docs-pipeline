@@ -491,7 +491,7 @@ def _ensure_staged(rel, staged, futures, file_size):
 # MAIN PIPELINE
 # =============================================================================
 
-def run_pipeline(test_mode=False, retry_failed=False, scan_only=False):
+def run_pipeline(test_mode=False, retry_failed=False, scan_only=False, force_scan=False):
     conn = init_db(PROGRESS_DB)
     mode = "test" if test_mode else "full"
     scan_start = time.time()
@@ -506,15 +506,26 @@ def run_pipeline(test_mode=False, retry_failed=False, scan_only=False):
     log.info(f"Servers: digital={HYBRID_DIGITAL_PORT} scanned={HYBRID_SCANNED_PORT}")
     log.info(f"{'='*60}")
 
-    # ── Phase 1: SCAN ──
-    if not retry_failed:
-        log.info("Phase 1: Scanning...")
+    # ── Phase 1: SCAN (skip if DB already populated) ──
+    existing_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+
+    if retry_failed:
+        pass  # no scan needed, just retry errors
+    elif existing_count > 0 and not force_scan:
+        log.info(f"Phase 1: Skipping scan — {existing_count:,} files already indexed.")
+        log.info("  (Use --scan to check for new/changed files)")
+    else:
+        if existing_count == 0:
+            log.info("Phase 1: First run — scanning...")
+        else:
+            log.info("Phase 1: Forced rescan...")
         files = scan_files(ONEDRIVE_ROOT)
         scan_elapsed = time.time() - scan_start
         if not files: log.error("No files found."); conn.close(); return
         queued = queue_new_files(conn, files)
-        log.info(f"Queued {queued:,} new/changed files")
+        log.info(f"Queued {queued:,} new/changed files (already had {existing_count:,})")
         del files; gc.collect()
+
     if scan_only: print_status(conn); conn.close(); return
 
     convert_start = time.time()
@@ -724,6 +735,7 @@ def main():
     parser.add_argument("--failed", action="store_true", help="List failed files")
     parser.add_argument("--retry-failed", action="store_true", help="Retry failures")
     parser.add_argument("--scan-only", action="store_true", help="Index without converting")
+    parser.add_argument("--scan", action="store_true", help="Force rescan for new/changed files")
     parser.add_argument("--reset", action="store_true", help="Start over")
 
     args = parser.parse_args()
@@ -744,7 +756,7 @@ def main():
                 if err: print(f"    → {err[:120]} (retries: {r})")
         conn.close(); return
     conn.close()
-    run_pipeline(test_mode=args.test, retry_failed=args.retry_failed, scan_only=args.scan_only)
-
+    run_pipeline(test_mode=args.test, retry_failed=args.retry_failed,
+                 scan_only=args.scan_only, force_scan=args.scan)
 if __name__ == "__main__":
     main()
