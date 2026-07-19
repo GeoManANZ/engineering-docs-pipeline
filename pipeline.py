@@ -279,17 +279,17 @@ def check_server(port: int) -> bool:
 def is_likely_scanned(pdf_path: Path, min_chars: int = 80) -> bool:
     """
     Classify a PDF as scanned (image-based) or digital (text-based).
-    Tries to extract text from the first 2 pages. If less than min_chars
-    of text is found, treat as scanned. Falls back to 'scanned' on error.
+    If classification fails (malformed PDF, pypdf crash), returns False
+    to route to digital server — safer than assuming scanned.
     """
     if pypdf is None:
-        return True  # conservative: treat as scanned if pypdf unavailable
+        return False  # can't classify — assume digital
     try:
-        reader = pypdf.PdfReader(str(pdf_path))
+        reader = pypdf.PdfReader(str(pdf_path), strict=False)
         text = "".join((p.extract_text() or "") for p in reader.pages[:2])
         return len(text.strip()) < min_chars
     except Exception:
-        return True
+        return False  # unreadable → don't force OCR, let digital server try
 
 # ── CHANGE 3: Pattern-based calc/design document detection ──
 _calc_re = re.compile("|".join(CALC_PATTERNS), re.IGNORECASE)
@@ -309,21 +309,26 @@ _CONVERT_WORKERS = 4  # Parallel conversion threads per server
 
 def convert_pdf(staged_path: Path, md_path: Path, hybrid_url: str,
                 hybrid_mode: str = "auto") -> dict:
-    """Convert one PDF via the appropriate hybrid server (digital or scanned)."""
+    """Convert one PDF via hybrid server. Retries on server errors."""
     if odl_convert is None:
         return {"status":"error","md_size":0,"error":"opendataloader_pdf not installed"}
-    try:
-        md_path.parent.mkdir(parents=True, exist_ok=True)
-        odl_convert(
-            input_path=[str(staged_path)], output_dir=str(md_path.parent),
-            format="markdown", hybrid="docling-fast",
-            hybrid_mode=hybrid_mode, hybrid_url=hybrid_url, quiet=True,
-        )
-        if md_path.exists() and md_path.stat().st_size > SMALL_FILE_THRESHOLD:
-            return {"status":"done","md_size":md_path.stat().st_size,"error":None}
-        return {"status":"missing","md_size":0,"error":"No .md produced"}
-    except Exception as e:
-        return {"status":"error","md_size":0,"error":str(e)[:500]}
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            md_path.parent.mkdir(parents=True, exist_ok=True)
+            odl_convert(
+                input_path=[str(staged_path)], output_dir=str(md_path.parent),
+                format="markdown", hybrid="docling-fast",
+                hybrid_mode=hybrid_mode, hybrid_url=hybrid_url, quiet=True,
+            )
+            if md_path.exists() and md_path.stat().st_size > SMALL_FILE_THRESHOLD:
+                return {"status":"done","md_size":md_path.stat().st_size,"error":None}
+            return {"status":"missing","md_size":0,"error":"No .md produced"}
+        except Exception as e:
+            last_error = str(e)[:500]
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAYS[attempt])
+    return {"status":"error","md_size":0,"error":last_error}
 
 def convert_docx(staged_path: Path, md_path: Path) -> dict:
     if MarkItDown is None:
