@@ -320,6 +320,20 @@ def is_calc_document(rel: str) -> bool:
 # This avoids wasting time on known-incompatible PDFs like large reference books.
 PERMANENT_FAIL_THRESHOLD = 2  # skip after this many failures
 
+def _is_permanent_error(error: str) -> bool:
+    """Detect errors that will never resolve with retry (corrupt PDF, Java crash)."""
+    if not error:
+        return False
+    permanent_patterns = [
+        "startxref",        # missing PDF structure
+        "IOException",      # Java I/O failure (corrupt PDF)
+        "Return code: 1",   # Java process crash
+        "NumberObject",     # corrupt PDF objects
+        "Invalid parent",   # bad xref
+        "PERMANENTLY SKIPPED",  # already flagged
+    ]
+    return any(p.lower() in error.lower() for p in permanent_patterns)
+
 # =============================================================================
 # CONVERTERS — Per-file parallel (not batch — hybrid server serializes batches)
 # =============================================================================
@@ -331,10 +345,9 @@ _CONVERT_WORKERS = 4  # Parallel conversion threads per server
 
 def convert_pdf(staged_path: Path, md_path: Path, hybrid_url: str,
                 hybrid_mode: str = "auto") -> dict:
-    """Convert one PDF via hybrid server. Retries on server errors."""
+    """Convert one PDF via hybrid server. Only retries transient errors."""
     if odl_convert is None:
         return {"status":"error","md_size":0,"error":"opendataloader_pdf not installed"}
-    last_error = None
     for attempt in range(MAX_RETRIES):
         try:
             md_path.parent.mkdir(parents=True, exist_ok=True)
@@ -347,10 +360,13 @@ def convert_pdf(staged_path: Path, md_path: Path, hybrid_url: str,
                 return {"status":"done","md_size":md_path.stat().st_size,"error":None}
             return {"status":"missing","md_size":0,"error":"No .md produced"}
         except Exception as e:
-            last_error = str(e)[:500]
+            err = str(e)[:500]
+            # Corrupt PDFs fail immediately — don't waste retries
+            if _is_permanent_error(err):
+                return {"status":"error","md_size":0,"error":err}
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_DELAYS[attempt])
-    return {"status":"error","md_size":0,"error":last_error}
+    return {"status":"error","md_size":0,"error":f"Failed after {MAX_RETRIES} attempts"}
 
 def convert_docx(staged_path: Path, md_path: Path) -> dict:
     if MarkItDown is None:
@@ -622,7 +638,7 @@ def run_pipeline(test_mode=False, retry_failed=False, scan_only=False, force_sca
                     prev_retries = conn.execute(
                         "SELECT retry_count, error FROM files WHERE rel_path=?", (rel,)
                     ).fetchone()
-                    if prev_retries and prev_retries[0] >= PERMANENT_FAIL_THRESHOLD:
+                    if prev_retries and (prev_retries[0] >= MAX_RETRIES or _is_permanent_error(prev_retries[1] or "")):
                         failed_files += 1
                         reason = (prev_retries[1] or "Unknown")[:100]
                         conn.execute(
@@ -669,7 +685,16 @@ def run_pipeline(test_mode=False, retry_failed=False, scan_only=False, force_sca
                             conn.execute("UPDATE files SET status='done',md_size=?,finished_at=?,error=NULL WHERE rel_path=?",(r["md_size"],datetime.now().isoformat(),rel))
                         else:
                             failed_files += 1
-                            conn.execute("UPDATE files SET status='error',error=?,retry_count=retry_count+1 WHERE rel_path=?",(r.get("error",""),rel))
+                            err_msg = r.get("error","")
+                            # Permanent errors: skip immediately, no retry
+                            if _is_permanent_error(err_msg):
+                                conn.execute(
+                                    "UPDATE files SET status='error',error=?,retry_count=? WHERE rel_path=?",
+                                    (f"SKIPPED: {err_msg[:150]}", MAX_RETRIES, rel))
+                            else:
+                                conn.execute(
+                                    "UPDATE files SET status='error',error=?,retry_count=retry_count+1 WHERE rel_path=?",
+                                    (err_msg, rel))
                         progress.update(converted=converted, skipped=skipped, failed=failed_files,
                                         staging_count=len(staging_futures), chunk_current=chunk_num,
                                         chunk_done=converted+skipped+failed_files, chunk_total=len(chunk),
@@ -684,7 +709,15 @@ def run_pipeline(test_mode=False, retry_failed=False, scan_only=False, force_sca
                     conn.execute("UPDATE files SET status='done',md_size=?,finished_at=?,error=NULL WHERE rel_path=?",(r["md_size"],datetime.now().isoformat(),rel))
                 else:
                     failed_files += 1
-                    conn.execute("UPDATE files SET status='error',error=?,retry_count=retry_count+1 WHERE rel_path=?",(r.get("error",""),rel))
+                    err_msg = r.get("error","")
+                    if _is_permanent_error(err_msg):
+                        conn.execute(
+                            "UPDATE files SET status='error',error=?,retry_count=? WHERE rel_path=?",
+                            (f"SKIPPED: {err_msg[:150]}", MAX_RETRIES, rel))
+                    else:
+                        conn.execute(
+                            "UPDATE files SET status='error',error=?,retry_count=retry_count+1 WHERE rel_path=?",
+                            (err_msg, rel))
                 progress.update(converted=converted, skipped=skipped, failed=failed_files,
                                 staging_count=0, chunk_current=chunk_num,
                                 chunk_done=converted+skipped+failed_files, chunk_total=len(chunk),
