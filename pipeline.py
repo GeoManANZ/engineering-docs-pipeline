@@ -316,6 +316,10 @@ def is_calc_document(rel: str) -> bool:
     """Return True if the document path matches a calc/design pattern."""
     return bool(_calc_re.search(rel))
 
+# Files that repeatedly fail with Java crashes are skipped permanently.
+# This avoids wasting time on known-incompatible PDFs like large reference books.
+PERMANENT_FAIL_THRESHOLD = 2  # skip after this many failures
+
 # =============================================================================
 # CONVERTERS — Per-file parallel (not batch — hybrid server serializes batches)
 # =============================================================================
@@ -603,7 +607,21 @@ def run_pipeline(test_mode=False, retry_failed=False, scan_only=False):
                     conn.execute("UPDATE files SET status='done',md_size=?,finished_at=? WHERE rel_path=?",(mp.stat().st_size,datetime.now().isoformat(),rel))
                     continue
                 if ext == ".pdf":
-                    # Pre-check: skip broken PDFs
+                    # Pre-check: skip files that have already failed repeatedly
+                    prev_retries = conn.execute(
+                        "SELECT retry_count, error FROM files WHERE rel_path=?", (rel,)
+                    ).fetchone()
+                    if prev_retries and prev_retries[0] >= PERMANENT_FAIL_THRESHOLD:
+                        failed_files += 1
+                        reason = (prev_retries[1] or "Unknown")[:100]
+                        conn.execute(
+                            "UPDATE files SET status='error',error=?,retry_count=? WHERE rel_path=?",
+                            (f"PERMANENTLY SKIPPED: {reason}", MAX_RETRIES, rel))
+                        progress.update(failed=failed_files, last_file=Path(rel).name)
+                        progress.draw()
+                        continue
+
+                    # Pre-check: skip broken/unreadable PDFs
                     broken, reason = is_broken_pdf(sp)
                     if broken:
                         failed_files += 1
