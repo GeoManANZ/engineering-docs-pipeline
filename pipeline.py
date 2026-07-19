@@ -367,17 +367,21 @@ def convert_pdf(staged_path: Path, md_path: Path, hybrid_url: str,
     for attempt in range(MAX_RETRIES):
         try:
             md_path.parent.mkdir(parents=True, exist_ok=True)
+            # Suppress Java subprocess noise on stderr
+            _save = sys.stderr
+            sys.stderr = io.StringIO()
             odl_convert(
                 input_path=[str(staged_path)], output_dir=str(md_path.parent),
                 format="markdown", hybrid="docling-fast",
                 hybrid_mode=hybrid_mode, hybrid_url=hybrid_url, quiet=True,
             )
+            sys.stderr = _save
             if md_path.exists() and md_path.stat().st_size > SMALL_FILE_THRESHOLD:
                 return {"status":"done","md_size":md_path.stat().st_size,"error":None}
             return {"status":"missing","md_size":0,"error":"No .md produced"}
         except Exception as e:
+            sys.stderr = _save
             err = str(e)[:500]
-            # Corrupt PDFs fail immediately — don't waste retries
             if _is_permanent_error(err):
                 return {"status":"error","md_size":0,"error":err}
             if attempt < MAX_RETRIES - 1:
