@@ -434,6 +434,9 @@ class Progress:
     def rate_str(self):
         if self.done < 3 or self.elapsed < 10: return "--"
         return f"{self.done/(self.elapsed/60):.1f} f/m"
+    @property
+    def pct(self):
+        return self.done/self.total*100 if self.total>0 else 0
 
     def update(self, **kw):
         for k, v in kw.items():
