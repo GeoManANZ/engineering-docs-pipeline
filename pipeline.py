@@ -279,17 +279,35 @@ def check_server(port: int) -> bool:
 def is_likely_scanned(pdf_path: Path, min_chars: int = 80) -> bool:
     """
     Classify a PDF as scanned (image-based) or digital (text-based).
-    If classification fails (malformed PDF, pypdf crash), returns False
-    to route to digital server — safer than assuming scanned.
+    If pypdf can extract text → digital. If it can't or crashes → scanned.
     """
     if pypdf is None:
-        return False  # can't classify — assume digital
+        return True  # no classifier → assume scanned (safer)
     try:
         reader = pypdf.PdfReader(str(pdf_path), strict=False)
         text = "".join((p.extract_text() or "") for p in reader.pages[:2])
         return len(text.strip()) < min_chars
     except Exception:
-        return False  # unreadable → don't force OCR, let digital server try
+        return True  # crash = no text = likely scanned
+
+def is_broken_pdf(pdf_path: Path) -> tuple[bool, str]:
+    """
+    Quick pre-check: can this PDF be opened at all?
+    Returns (is_broken, reason).
+    Saves time by skipping hopeless files before sending to the hybrid server.
+    """
+    if pypdf is None:
+        return (False, "")  # can't check, let converter try
+    try:
+        reader = pypdf.PdfReader(str(pdf_path), strict=False)
+        if reader.is_encrypted:
+            return (True, "Password protected")
+        # Try reading first page to verify structure
+        if len(reader.pages) > 0:
+            _ = reader.pages[0]  # triggers lazy loading
+        return (False, "")
+    except Exception as e:
+        return (True, f"Unreadable PDF: {str(e)[:80]}")
 
 # ── CHANGE 3: Pattern-based calc/design document detection ──
 _calc_re = re.compile("|".join(CALC_PATTERNS), re.IGNORECASE)
@@ -585,6 +603,17 @@ def run_pipeline(test_mode=False, retry_failed=False, scan_only=False):
                     conn.execute("UPDATE files SET status='done',md_size=?,finished_at=? WHERE rel_path=?",(mp.stat().st_size,datetime.now().isoformat(),rel))
                     continue
                 if ext == ".pdf":
+                    # Pre-check: skip broken PDFs
+                    broken, reason = is_broken_pdf(sp)
+                    if broken:
+                        failed_files += 1
+                        conn.execute(
+                            "UPDATE files SET status='error',error=?,retry_count=? WHERE rel_path=?",
+                            (f"Skipped: {reason}", MAX_RETRIES, rel))
+                        progress.update(failed=failed_files, last_file=Path(rel).name)
+                        progress.draw()
+                        continue
+
                     if is_likely_scanned(sp):
                         url = scanned_url
                         mode = "full"
