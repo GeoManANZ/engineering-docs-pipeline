@@ -414,30 +414,33 @@ class Progress:
     def __init__(self, total_pending: int, total_chunks: int):
         self.total = total_pending; self.total_chunks = total_chunks
         self.converted = 0; self.skipped = 0; self.failed = 0
-        self.convert_start = time.time()
+        self.convert_start = 0.0  # set on first actual conversion
         self.last_file = ""; self.staging_count = 0; self.last_size = ""
         self.chunk_current = 0; self.chunk_total = 0; self.chunk_done = 0
 
     @property
     def done(self): return self.converted + self.skipped + self.failed
     @property
-    def elapsed(self): return time.time() - self.convert_start
+    def elapsed(self):
+        if self.convert_start == 0: return 0.001
+        return max(time.time() - self.convert_start, 0.001)
     @property
     def eta(self):
-        if self.done == 0: return "--:--"
+        if self.done < 3 or self.elapsed < 10:
+            return "warming up..."
         rate = self.done / self.elapsed
-        return str(timedelta(seconds=int((self.total-self.done)/rate))) if rate>0 else "--:--"
+        return str(timedelta(seconds=int((self.total-self.done)/rate)))
     @property
     def rate_str(self):
-        if self.done == 0: return "--"
+        if self.done < 3 or self.elapsed < 10: return "--"
         return f"{self.done/(self.elapsed/60):.1f} f/m"
-    @property
-    def pct(self):
-        return self.done/self.total*100 if self.total>0 else 0
 
     def update(self, **kw):
         for k, v in kw.items():
             if hasattr(self, k): setattr(self, k, v)
+        # Start convert timer on first actual work
+        if self.convert_start == 0 and self.done > 0:
+            self.convert_start = time.time()
 
     def draw(self):
         bar_w = 20
