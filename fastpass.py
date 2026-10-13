@@ -233,7 +233,13 @@ def run(root: Path, out: Path, dry_run: bool, limit: int | None) -> None:
             rel = str(path)
 
         prev = seen.get(rel)
-        if prev and prev.get("verdict") in ("digital", "thin") and prev.get("status") == "ok":
+        # Skip anything already classified with a clean status. Status may be
+        # "ok", "ok (ok)", "ok (plaintext)" or "ok (docx)" depending on which
+        # writer produced it — match on the prefix, never equality. Errors are
+        # deliberately NOT skipped so re-runs retry them.
+        if (prev
+                and prev.get("verdict") in ("digital", "thin", "needs_ocr")
+                and str(prev.get("status", "")).startswith("ok")):
             skipped += 1
             continue
 
