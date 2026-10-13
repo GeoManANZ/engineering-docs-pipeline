@@ -1,5 +1,10 @@
 # Engineering Docs Pipeline v6 — Batch Optimized
 
+> **⚠ SUPERSEDED — do not deploy this method.**
+> It requires a ~32-hour uninterrupted run with two GPU daemons; it OOM-crashes
+> after a few hours on the laptop. Use the v7 method in **[DEPLOYMENT.md](DEPLOYMENT.md)**
+> instead (many small jobs, `fastpass.py` first, OCR only the measured residue).
+
 PDF + DOCX → Markdown converter with GPU-accelerated OCR, formula extraction, pre-fetch staging, and OneDrive space management.
 
 ## What Changed in v6 (Major Performance Update)
