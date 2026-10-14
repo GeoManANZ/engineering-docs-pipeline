@@ -206,17 +206,22 @@ def walk_sources(root: Path):
 
 # ── Main pass ────────────────────────────────────────────────────────────────
 
-def run(root: Path, out: Path, dry_run: bool, limit: int | None) -> None:
+def run(walk_roots: list[Path], rel_root: Path, out: Path,
+        dry_run: bool, limit: int | None) -> None:
     out.mkdir(parents=True, exist_ok=True)
     manifest = out / ".fastpass.jsonl"
     seen = load_seen(manifest)
 
-    files = list(walk_sources(root))
+    files: list[Path] = []
+    for wr in walk_roots:
+        files.extend(walk_sources(wr))
     if limit:
         files = files[:limit]
     total = len(files)
 
-    print(f"Source : {root}")
+    print(f"Corpus : {rel_root}")
+    if len(walk_roots) > 1:
+        print(f"Walk   : {len(walk_roots)} subtrees")
     print(f"Output : {out}")
     print(f"Found  : {total:,} documents")
     print(f"Already: {len(seen):,} in manifest")
@@ -228,7 +233,7 @@ def run(root: Path, out: Path, dry_run: bool, limit: int | None) -> None:
 
     for i, path in enumerate(files, 1):
         try:
-            rel = str(path.relative_to(root))
+            rel = str(path.relative_to(rel_root))
         except ValueError:
             rel = str(path)
 
@@ -392,6 +397,9 @@ def main() -> None:
     ap.add_argument("--report", action="store_true", help="show the split from the manifest")
     ap.add_argument("--residue", metavar="FILE", help="write the OCR to-do list to FILE")
     ap.add_argument("--limit", type=int, help="only process the first N files")
+    ap.add_argument("--subtree", action="append", metavar="DIR",
+                    help="walk only this subtree (repeatable); rel paths and "
+                         "the output layout stay relative to the corpus root")
     args = ap.parse_args()
 
     root = find_root(args.root)
@@ -406,7 +414,15 @@ def main() -> None:
         print("Pass --root /path/to/docs to point at it.", file=sys.stderr)
         sys.exit(1)
 
-    run(root, out, args.dry_run, args.limit)
+    walk_roots = [Path(s) for s in (args.subtree or [])]
+    if walk_roots:
+        for st in walk_roots:
+            if not st.exists():
+                print(f"Subtree does not exist: {st}", file=sys.stderr)
+                sys.exit(1)
+        run(walk_roots, root, out, args.dry_run, args.limit)
+    else:
+        run([root], root, out, args.dry_run, args.limit)
 
 
 if __name__ == "__main__":
