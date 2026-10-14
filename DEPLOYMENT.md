@@ -26,6 +26,34 @@ OCR residue — never the whole library, never in the background.
 
 ---
 
+## Crash-recovery checklist (used 2026-10-14)
+
+The run is crash-safe by design; after any hard stop, before resuming:
+
+1. `wc -l ~/engineering-md/.fastpass.jsonl` — manifest is the sole resume
+   authority. A torn final JSON line is tolerated and ignored.
+2. Check the status mix, not just the count:
+   `python3 - <<<'import json,collections;print(collections.Counter(json.loads(l)["status"][:12] for l in open("/home/chrb/engineering-md/.fastpass.jsonl") if l.strip()))'`
+   - `ok (ok)` = layout-aware markdown (correct). `ok (plaintext)` = raw-text
+     FALLBACK — a run producing only these means pymupdf4llm is missing from
+     the interpreter you actually used. Re-check with
+     `~/pdf-convert-venv/bin/python -c "import pymupdf4llm"` and redo those
+     entries (drop their manifest lines; original backup first).
+   - `ok` with verdict `digital` = dry-run record, no .md was written, but
+     resume-skip WILL match it. Drop before a real run.
+3. Packages live in `~/pdf-convert-venv` (pymupdf, pymupdf4llm,
+   markitdown[docx,xls]). `~/.local` user-site also has pymupdf — running
+   with system python3 silently picks a different toolchain than the venv.
+   Always invoke `~/pdf-convert-venv/bin/python fastpass.py` explicitly.
+4. If the machine hard-died mid-run: check `.wslconfig` still has
+   `pageReporting=false` (this is what stops the WSL page cache from
+   ballooning into Windows and power-killing the laptop), and confirm in
+   Event Viewer (System log, Event ID 41/6008) whether it was a bugcheck
+   or a hang.
+5. `~/residue.txt` is only valid if written AFTER the last full pass —
+   regenerate with `--report --residue ~/residue.txt` when the pass
+   completes.
+
 ## Stage 0 — one-time prep (~10 min)
 
 Cap the WSL2 VM so its page cache cannot balloon into Windows and OOM the
