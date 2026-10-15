@@ -54,6 +54,26 @@ The run is crash-safe by design; after any hard stop, before resuming:
    regenerate with `--report --residue ~/residue.txt` when the pass
    completes.
 
+## Known issue: paths ≥260 chars never hydrate
+
+23 documents sit at 260-291 char full paths. They enumerate and pin fine but
+OneDrive's placeholder never downloads (Windows-side reads fail with "could
+not find a part of the path"), so WSL sees EIO forever. OneDrive restarts do
+NOT flush them. Short-path (8.3) reads also fail — components lack 8.3 names.
+
+Fix options, in order of least disruption:
+1. Rename one long intermediate folder per stuck cluster (e.g.
+   `6.12 Incident Reporting\WI Internal Reporting` -> `6.12 IR\WI IR`),
+   convert, rename back. Orphans some manifest rel-paths; acceptable.
+2. `reg add HKLM\SYSTEM\CurrentControlSet\Control\FileSystem /v
+   LongPathsEnabled /t REG_DWORD /d 1` (admin) + reboot — may not fix
+   OneDrive's placeholder driver.
+3. Download the 23 from onedrive.com manually.
+
+The authoritative stuck list = manifest records with `error: cannot open`
+whose paths are ≥260 chars. Their error records retry every run, so no
+further plumbing is needed once the files hydrate.
+
 ## Stage 0 — one-time prep (~10 min)
 
 Cap the WSL2 VM so its page cache cannot balloon into Windows and OOM the
