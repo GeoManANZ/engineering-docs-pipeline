@@ -206,7 +206,7 @@ def walk_sources(root: Path):
 
 # ── Main pass ────────────────────────────────────────────────────────────────
 
-def run(walk_roots: list[Path], rel_root: Path, out: Path,
+def run(walk_roots: list[Path], root_files: list[Path], rel_root: Path, out: Path,
         dry_run: bool, limit: int | None) -> None:
     out.mkdir(parents=True, exist_ok=True)
     manifest = out / ".fastpass.jsonl"
@@ -215,6 +215,9 @@ def run(walk_roots: list[Path], rel_root: Path, out: Path,
     files: list[Path] = []
     for wr in walk_roots:
         files.extend(walk_sources(wr))
+    for rf in root_files:  # immediate children only — no subdirectories
+        files.extend(p for p in sorted(rf.iterdir())
+                     if p.is_file() and p.suffix.lower() in ALL_EXT)
     if limit:
         files = files[:limit]
     total = len(files)
@@ -400,6 +403,9 @@ def main() -> None:
     ap.add_argument("--subtree", action="append", metavar="DIR",
                     help="walk only this subtree (repeatable); rel paths and "
                          "the output layout stay relative to the corpus root")
+    ap.add_argument("--root-files", action="append", metavar="DIR",
+                    help="process only files directly in DIR, not its "
+                         "subdirectories (repeatable)")
     args = ap.parse_args()
 
     root = find_root(args.root)
@@ -415,14 +421,12 @@ def main() -> None:
         sys.exit(1)
 
     walk_roots = [Path(s) for s in (args.subtree or [])]
-    if walk_roots:
-        for st in walk_roots:
-            if not st.exists():
-                print(f"Subtree does not exist: {st}", file=sys.stderr)
-                sys.exit(1)
-        run(walk_roots, root, out, args.dry_run, args.limit)
-    else:
-        run([root], root, out, args.dry_run, args.limit)
+    root_files = [Path(s) for s in (args.root_files or [])]
+    for st in walk_roots + root_files:
+        if not st.exists():
+            print(f"Subtree does not exist: {st}", file=sys.stderr)
+            sys.exit(1)
+    run(walk_roots, root_files, root, out, args.dry_run, args.limit)
 
 
 if __name__ == "__main__":
