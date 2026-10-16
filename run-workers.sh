@@ -35,7 +35,7 @@ W10_OHW_SUBTREES=("OHW Standard Drawings" "Aus Chartership" "Australian Tunnelli
 
 cmd() {
     local log="$1"; shift
-    local line="nice -n 10 $PY $REPO/fastpass.py --root '$ROOT'"
+    local line="OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 taskset -c 0-9 nice -n 10 $PY $REPO/fastpass.py --root '$ROOT'"
     local s
     for s in "$@"; do line+=" --subtree '$ROOT/$s'"; done
     line+=" 2>&1 | tee -a $MD/$log"
@@ -44,7 +44,7 @@ cmd() {
 
 cmdrf() {  # --root-files variant: loose files directly in DIR
     local log="$1"; shift
-    local line="nice -n 10 $PY $REPO/fastpass.py --root '$ROOT'"
+    local line="OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 taskset -c 0-9 nice -n 10 $PY $REPO/fastpass.py --root '$ROOT'"
     local s
     for s in "$@"; do line+=" --root-files '$ROOT/$s'"; done
     line+=" 2>&1 | tee -a $MD/$log"
