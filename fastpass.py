@@ -426,6 +426,8 @@ def main() -> None:
         if not st.exists():
             print(f"Subtree does not exist: {st}", file=sys.stderr)
             sys.exit(1)
+    if not walk_roots and not root_files:  # plain --root: walk the whole corpus
+        walk_roots = [root]
     run(walk_roots, root_files, root, out, args.dry_run, args.limit)
 
 
