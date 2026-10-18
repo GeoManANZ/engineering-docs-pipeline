@@ -59,10 +59,14 @@ def bar(done: float, total: float, width: int = 32) -> str:
     return "[" + "█" * filled + "░" * (width - filled) + "] " + pct
 
 
-def parse_manifest(path: Path) -> tuple[dict[str, str], int]:
-    """Return {rel: verdict-or-status-class} unique-by-rel (later wins) + line count."""
+def parse_manifest(path: Path) -> tuple[dict[str, str], int, list[dict], int]:
+    """Return {rel: verdict-class} unique-by-rel (later wins), line count,
+    the last 10 completed-file records, and the live GPU-queue contribution
+    (needs_ocr + thin-fast files: everything Stage 2 still owes a pass)."""
     seen: dict[str, str] = {}
     lines = 0
+    recent: list[dict] = []
+    queue = 0
     try:
         with path.open(encoding="utf-8") as fh:
             for line in fh:
@@ -80,13 +84,73 @@ def parse_manifest(path: Path) -> tuple[dict[str, str], int]:
                 is_done = v in ("digital", "thin") and s.startswith("ok")
                 if is_done:
                     seen[rel] = "done"
+                    if s.startswith("ok (thin"):  # thin-fast: still owes a GPU pass
+                        queue += 1
+                    recent.append({"rel": rel, "size": r.get("size") or 0,
+                                   "secs": r.get("secs"), "how": s.strip("() \n")[:12]})
+                    del recent[:-10]
                 elif v == "needs_ocr":
                     seen[rel] = "ocr"
+                    queue += 1
                 else:
                     seen[rel] = "err"
     except FileNotFoundError:
         pass
-    return seen, lines
+    # thin-fast files are 'done' in seen but still owe a GPU pass
+    return seen, lines, recent, queue
+
+
+def gpu_recent(n: int = 10) -> list[dict]:
+    out: list[dict] = []
+    try:
+        with OCRPASS_MF.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(r.get("status", "")).startswith("ok"):
+                    out.append({"rel": r.get("rel", "?"),
+                                "size": r.get("size") or 0,
+                                "secs": r.get("secs"), "how": "ocr"})
+                    del out[:-n]
+    except FileNotFoundError:
+        pass
+    # enrich with live size (records don't store it)
+    for rec in out:
+        if not rec["size"]:
+            for root in ("/mnt/c/Users/Chris/OneDrive/02. Work", str(HOME / "work-docs")):
+                try:
+                    rec["size"] = os.path.getsize(os.path.join(root, rec["rel"]))
+                    break
+                except OSError:
+                    continue
+    return out
+
+
+def fmt_size(n) -> str:
+    n = n or 0
+    return f"{n/2**20:.1f}MB" if n >= 2**20 else f"{n/2**10:.0f}KB"
+
+
+def fmt_secs(s) -> str:
+    if s is None:
+        return "  -  "
+    s = float(s)
+    return f"{int(s//60)}m{s%60:02.0f}" if s >= 60 else f"{s:.1f}s"
+
+
+def print_recent(items: list[dict], indent: str = "  ") -> None:
+    if not items:
+        print(f"{indent}{C_DIM}(nothing completed yet){C_RESET}")
+        return
+    for r in reversed(items[-10:]):  # newest last, like a log
+        rel = r["rel"]
+        tail = ("…" + rel[-58:]) if len(rel) > 59 else rel
+        print(f"{indent}{fmt_size(r['size']):>8}  {fmt_secs(r['secs']):>6}  {tail}")
 
 
 def local_workers_alive() -> int:
@@ -125,26 +189,33 @@ def fetch_vps(force: bool = False) -> dict | None:
         return vps_cache["data"]
     script = (
         "python3 - <<'PY'\n"
-        "import json\n"
-        "uniq={}\n"
+        "import json, os, subprocess\n"
+        "uniq={}; recent=[]\n"
         "for l in open('/home/geo/fastpass-vps/out/.fastpass.jsonl'):\n"
         "    l=l.strip()\n"
         "    if not l: continue\n"
         "    try: r=json.loads(l)\n"
         "    except: continue\n"
         "    v,s=r.get('verdict'),str(r.get('status',''))\n"
-        "    uniq[r['rel']]='done' if (v in ('digital','thin') and s.startswith('ok')) "
+        "    cls='done' if (v in ('digital','thin') and s.startswith('ok')) "
         "else ('ocr' if v=='needs_ocr' else 'err')\n"
+        "    uniq[r['rel']]=cls\n"
+        "    if cls=='done':\n"
+        "        recent.append({'rel':r['rel'],'size':r.get('size') or 0,'secs':r.get('secs')})\n"
+        "        del recent[:-10]\n"
+        "gb=0\n"
+        "try:\n"
+        "    out=subprocess.run(['du','-sb','/home/geo/fastpass-vps/corpus'],"
+        "capture_output=True,text=True).stdout.split()\n"
+        "    gb=round(int(out[0])/2**30,1)\n"
+        "except Exception: pass\n"
         "print(json.dumps({'done':sum(1 for x in uniq.values() if x=='done'),"
         "'ocr':sum(1 for x in uniq.values() if x=='ocr'),"
         "'err':sum(1 for x in uniq.values() if x=='err'),"
-        "'gb':round(__import__('os').path.getsize('/dev/null') and 0 or "
-        "__import__('subprocess').run(['du','-sb','/home/geo/fastpass-vps/corpus'],"
-        "capture_output=True,text=True).stdout.split()[0].__class__ and "
-        "int(__import__('subprocess').run(['du','-sb','/home/geo/fastpass-vps/corpus'],"
-        "capture_output=True,text=True).stdout.split()[0])/2**30,1),"
-        "'loop': __import__('subprocess').run(['pgrep','-f','worker-loop'],"
-        "capture_output=True,text=True).returncode==0}))\n"
+        "'gb':gb,"
+        "'loop': subprocess.run(['pgrep','-f','worker-loop'],"
+        "capture_output=True).returncode==0,"
+        "'recent':recent}))\n"
         "PY"
     )
     try:
@@ -198,6 +269,11 @@ def render(state: dict) -> None:
           f"errors parked {loc['err'] + (vps or {}).get('err', 0):,} · "
           f"workers {state['workers']}/4 + vps "
           f"{('loop ' + (C_GREEN + 'on' + C_RESET)) if (vps or {}).get('loop') else (C_RED + 'OFF' + C_RESET)}")
+    print(f"  {C_DIM}last completed — laptop workers:{C_RESET}")
+    print_recent(state["loc_recent"])
+    if vps and vps.get("recent"):
+        print(f"  {C_DIM}last completed — vps worker:{C_RESET}")
+        print_recent(vps["recent"])
     print()
 
     # ── Upload ──
@@ -212,6 +288,8 @@ def render(state: dict) -> None:
     print(f"{C_GREEN}STAGE 2 — GPU OCR (MinerU on 5070 Ti){C_RESET}")
     print(f"  ocr     {bar(g, max(q, 1))}  {g:,}/{q:,} queue"
           f"{rate(state['d_gpu'], state['elapsed'])}{eta_str(q - g, state['gpu_rate'])}")
+    print(f"  {C_DIM}last completed — gpu worker:{C_RESET}")
+    print_recent(state["gpu_recent"])
     print()
 
     print(f"{C_DIM}  progress cmd: wc -l < ~/engineering-md/.fastpass.jsonl · "
@@ -229,12 +307,14 @@ def main() -> None:
                    "l_prev": None, "v_prev": None, "g_prev": None}
     try:
         while True:
-            loc_seen, _ = parse_manifest(FASTPASS_MF)
+            loc_seen, _, loc_recent, queue = parse_manifest(FASTPASS_MF)
             loc = {"done": sum(1 for v in loc_seen.values() if v == "done"),
                    "ocr": sum(1 for v in loc_seen.values() if v == "ocr"),
                    "err": sum(1 for v in loc_seen.values() if v == "err"),
                    "done_vps_scope": sum(1 for k, v in loc_seen.items()
                                           if v == "done" and in_vps_scope(k))}
+            state["loc_recent"] = loc_recent
+            state["gpu_recent"] = gpu_recent()
             vps = None if args.no_ssh else fetch_vps(force=state["first"])
             vps_done_set = set()
             if state["first"]:
@@ -252,7 +332,7 @@ def main() -> None:
                 if state["elapsed"] > 0:
                     state["gpu_rate"] = state["d_gpu"] / state["elapsed"] * 3600
             state.update(local=loc, vps=vps, workers=local_workers_alive(),
-                         queue=queue_len(), gpu=state.get("g_prev", 0),
+                         queue=queue, gpu=state.get("g_prev", 0),
                          rsync=subprocess.run(["pgrep", "-f", "rsync.*02. Work"],
                                               capture_output=True).returncode == 0)
             render(state)
