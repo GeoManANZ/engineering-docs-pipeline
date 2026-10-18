@@ -43,7 +43,7 @@ OUT = Path.home() / "engineering-md"
 MANIFEST = OUT / ".ocrpass.jsonl"
 MINERU = str(Path.home() / "mineru-venv/bin/mineru")
 SCRATCH = Path.home() / ".hermes/cache/scratch/ocrpass-out"
-WAIT_S = 900  # max seconds per file (giant books)
+WAIT_S = 300  # max seconds per file (valid parses run <2min; hung files release at 5)
 
 
 def load_seen() -> dict[str, dict]:
