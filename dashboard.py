@@ -86,9 +86,10 @@ def parse_manifest(path: Path) -> tuple[dict[str, str], int, list[dict], int]:
                     seen[rel] = "done"
                     if s.startswith("ok (thin"):  # thin-fast: still owes a GPU pass
                         queue += 1
-                    recent.append({"rel": rel, "size": r.get("size") or 0,
-                                   "secs": r.get("secs"), "how": s.strip("() \n")[:12]})
-                    del recent[:-10]
+                    if not s.startswith("ok (skipped"):  # skips aren't conversions
+                        recent.append({"rel": rel, "size": r.get("size") or 0,
+                                       "secs": r.get("secs"), "how": s.strip("() \n")[:12]})
+                        del recent[:-10]
                 elif v == "needs_ocr":
                     seen[rel] = "ocr"
                     queue += 1
