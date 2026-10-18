@@ -282,8 +282,15 @@ def run(walk_roots: list[Path], root_files: list[Path], rel_root: Path, out: Pat
                 "digital" if chars >= DOCX_MIN_CHARS else "thin")
 
         # Only pay for layout-aware markdown when there IS a text layer.
+        # THIN-FAST (2026-10-17): sparse-text PDFs (cpp < 150) skip the
+        # expensive layout+OCR pass entirely — write the probe text layer
+        # now (status "ok (thinfast)") and let Stage 2 on the GPU do the
+        # full-quality pass via the residue list. Resumes like any ok-*.
         if verdict in ("digital", "thin") and not dry_run:
-            md, how = pdf_to_markdown(path, text) if ext in PDF_EXT else (text, "docx")
+            if verdict == "thin" and ext in PDF_EXT:
+                md, how = text, "thinfast"
+            else:
+                md, how = pdf_to_markdown(path, text) if ext in PDF_EXT else (text, "docx")
             if how == "plaintext":
                 verdict = "thin"
             md_path = out / Path(rel).with_suffix(".md")
@@ -378,12 +385,19 @@ def report(root: Path, out: Path, residue_path: str | None) -> None:
     print("=" * 64)
 
     if residue_path:
-        rows = sorted((r for r in seen.values() if r.get("verdict") == "needs_ocr"),
+        # Stage-2 queue = pure scans (needs_ocr) + thin-fast files whose
+        # scanned pages were deliberately deferred to the GPU pass.
+        rows = sorted((r for r in seen.values()
+                       if r.get("verdict") == "needs_ocr"
+                       or (r.get("verdict") == "thin"
+                           and str(r.get("status", "")).startswith("ok (thin"))),
                       key=lambda r: r.get("size") or 0, reverse=True)
         with open(residue_path, "w", encoding="utf-8") as fh:
             for r in rows:
                 fh.write(str(Path(root) / r["rel"]) + "\n")
-        print(f"\n  OCR to-do list -> {residue_path} ({len(rows):,} files)")
+        thinfast = sum(1 for r in rows if r.get("verdict") == "thin")
+        print(f"\n  Stage-2 GPU queue -> {residue_path} "
+              f"({len(rows):,} files: {len(rows)-thinfast:,} scans + {thinfast:,} thin-fast)")
 
     errs = [r for r in seen.values() if r.get("verdict") == "error"]
     if errs:
