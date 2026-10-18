@@ -27,6 +27,23 @@ RESIDUE = HOME / "residue.txt"
 TOTAL_SCOPE = 20_193          # docs in scope (OLEMI excluded)
 CORPUS_TARGET_GB = 23.0       # expected VPS corpus size when upload completes
 
+# VPS-owned scopes (disjoint from laptop lanes): overlap between the two
+# manifests equals local-done files inside these scopes (arrive via vps-pull).
+VPS_TOP = {"TSP Projects", "Vancouver Geotechnical Society", "M Bolton Publications",
+           "Geotechnique", "Byland Technical", "Civil Engineering Books",
+           "RR Technical Info", "Conferences", "ICE Professional Review Docs"}
+GEO = "Geotechnical Documents"
+VPS_GEO_SUB = {"ICE Civil Engineering", "BHe HardDrive", "Road & Pavement Design",
+               "GRL Engineers", "ICE Ground Improvement",
+               "Australian Geomechanics Journal", "Victoria Basin Studies"}
+
+
+def in_vps_scope(rel: str) -> bool:
+    parts = rel.split("/")
+    if parts[0] in VPS_TOP:
+        return True
+    return parts[0] == GEO and len(parts) > 1 and f"{parts[1]}" in VPS_GEO_SUB
+
 C_GREEN, C_YELLOW, C_RED, C_CYAN, C_DIM, C_RESET = (
     "\033[32m", "\033[33m", "\033[31m", "\033[36m", "\033[2m", "\033[0m")
 
@@ -60,7 +77,8 @@ def parse_manifest(path: Path) -> tuple[dict[str, str], int]:
                 rel, v, s = r.get("rel"), r.get("verdict"), str(r.get("status", ""))
                 if rel is None:
                     continue
-                if v in ("digital", "thin") and s.startswith("ok"):
+                is_done = v in ("digital", "thin") and s.startswith("ok")
+                if is_done:
                     seen[rel] = "done"
                 elif v == "needs_ocr":
                     seen[rel] = "ocr"
@@ -75,7 +93,7 @@ def local_workers_alive() -> int:
     try:
         out = subprocess.run(["pgrep", "-f", "pdf-convert-venv/bin/python.*fastpass"],
                              capture_output=True, text=True, timeout=5).stdout.split()
-        return max(0, len(out) - 1)  # minus our own wrapper if it matches
+        return len(out)
     except Exception:
         return -1
 
@@ -167,14 +185,13 @@ def render(state: dict) -> None:
     loc = state["local"]
     vps = state["vps"]
     l_done, v_done = loc["done"], (vps or {}).get("done", 0)
-    overlap = len(loc["done_set"] & state["vps_done_set"])
-    combined_done = l_done + v_done - overlap
+    combined_done = l_done + max(0, v_done - loc["done_vps_scope"])  # conservative when vps data absent
     print(f"{C_GREEN}STAGE 1 — text conversion (fastpass){C_RESET}")
     print(f"  laptop  {bar(l_done, TOTAL_SCOPE)}  {l_done:,} done{rate(state['d_lap'], state['elapsed'])}")
     if vps is not None:
         print(f"  vps     {bar(v_done, TOTAL_SCOPE)}  {v_done:,} done{rate(state['d_vps'], state['elapsed'])}")
     else:
-        print(f"  vps     {C_DIM}unreachable — showing cached{C_RESET}")
+        print(f"  vps     {C_DIM}ssh disabled or unreachable — combined shows laptop + pulled only{C_RESET}")
     print(f"  {C_YELLOW}COMBINED{C_RESET} {bar(combined_done, TOTAL_SCOPE)}  "
           f"{combined_done:,}/{TOTAL_SCOPE:,}")
     print(f"          OCR-queue {loc['ocr'] + (vps or {}).get('ocr', 0):,} · "
@@ -216,7 +233,8 @@ def main() -> None:
             loc = {"done": sum(1 for v in loc_seen.values() if v == "done"),
                    "ocr": sum(1 for v in loc_seen.values() if v == "ocr"),
                    "err": sum(1 for v in loc_seen.values() if v == "err"),
-                   "done_set": {k for k, v in loc_seen.items() if v == "done"}}
+                   "done_vps_scope": sum(1 for k, v in loc_seen.items()
+                                          if v == "done" and in_vps_scope(k))}
             vps = None if args.no_ssh else fetch_vps(force=state["first"])
             vps_done_set = set()
             if state["first"]:
