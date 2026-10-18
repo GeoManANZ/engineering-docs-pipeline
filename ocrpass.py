@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-ocrpass.py — Stage 2: GPU OCR of the fastpass residue (scans + thin-fast).
-Per DEPLOYMENT.md: chunked MinerU runs, one process, crash-safe manifest.
+ocrpass.py — Stage 2 GPU OCR over the fastpass residue (scans + thin-fast).
+MinerU 4.x edition: per-file `mineru parse` against the local GPU server.
 
-Flow per file:
-  1. skip if already ok in ~/.ocrpass.jsonl (append-only, fsync per record)
-  2. stage a collision-safe copy to ~/ocr-stage/<key>__<basename>
-  3. `mineru -p <staged> -o <chunk-out> -b pipeline` (one invocation per chunk)
-  4. move the resulting .md to ~/engineering-md/<rel>.md (replaces thin-fast
-     output or creates new for needs_ocr scans), keep images under
-     ~/engineering-md/_ocr_images/<key>/
-  5. record + fsync, clean staging
+- Queue: ~/residue.txt (absolute paths), regenerable via
+  `fastpass.py --report --residue ~/residue.txt` any time.
+- Manifest: ~/engineering-md/.ocrpass.jsonl (append-only, fsync per record,
+  later-wins) — crash-safe pause/resume like fastpass.
+- Output .md goes to ~/engineering-md/<rel>.md (replaces thin-fast text or
+  creates new for scans). Sibling image dirs are preserved under
+  _ocr_images/<key>/ with links rewritten.
+- Two-strike error parking: a file that fails twice is parked, not retried.
 
 Usage:
-  python3 ocrpass.py                    # full run over ~/residue.txt
-  python3 ocrpass.py --queue FILE       # alternate queue
-  python3 ocrpass.py --limit N          # only first N pending
+  nice -n 10 taskset -c 12-17 python3 ocrpass.py            # run lane
+  python3 ocrpass.py --limit 20                             # small test
 """
 from __future__ import annotations
 
@@ -25,16 +24,26 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 
-CORPUS = Path("/mnt/c/Users/Chris/OneDrive/02. Work")
+CORPUS_ROOTS = [Path("/mnt/c/Users/Chris/OneDrive/02. Work"),
+                Path.home() / "work-docs"]  # symlink alias used by residue.txt
+
+
+def rel_for(abspath: str) -> str | None:
+    p = Path(abspath)
+    for root in CORPUS_ROOTS:
+        try:
+            return str(p.relative_to(root))
+        except ValueError:
+            continue
+    return None
 OUT = Path.home() / "engineering-md"
-STAGE = Path.home() / "ocr-stage"
 MANIFEST = OUT / ".ocrpass.jsonl"
-MINERU = Path.home() / "mineru-venv/bin/mineru"
-CHUNK = 100  # files per mineru invocation (large books -> keep modest)
+MINERU = str(Path.home() / "mineru-venv/bin/mineru")
+SCRATCH = Path.home() / ".hermes/cache/scratch/ocrpass-out"
+WAIT_S = 900  # max seconds per file (giant books)
 
 
 def load_seen() -> dict[str, dict]:
@@ -67,116 +76,83 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--queue", default=str(Path.home() / "residue.txt"))
     ap.add_argument("--limit", type=int)
-    ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     queue = [l.strip() for l in open(args.queue, encoding="utf-8") if l.strip()]
     seen = load_seen()
     pending = []
     for abspath in queue:
-        try:
-            rel = str(Path(abspath).relative_to(CORPUS))
-        except ValueError:
+        rel = rel_for(abspath)
+        if rel is None:
             continue
         prev = seen.get(rel)
         if prev and str(prev.get("status", "")).startswith("ok"):
             continue
         if prev and prev.get("attempts", 0) >= 2:
-            continue  # two strikes: parked
+            continue
         pending.append((rel, abspath))
     if args.limit:
         pending = pending[:args.limit]
 
-    print(f"queue: {len(queue)} | done: {len(seen)} | pending: {len(pending)}")
-    if args.dry_run or not pending:
+    print(f"queue: {len(queue)} | done: {len(seen)} | pending: {len(pending)}", flush=True)
+    if not pending:
         return
 
+    SCRATCH.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    done = 0
-    for i in range(0, len(pending), CHUNK):
-        batch = pending[i:i + CHUNK]
-        STAGE.mkdir(parents=True, exist_ok=True)
-        staged: list[tuple[str, Path]] = []
-        for rel, abspath in batch:
-            src = Path(abspath)
-            if not src.exists():
-                append({"rel": rel, "status": "error: source missing",
-                        "attempts": (seen.get(rel, {}).get("attempts", 0) + 1)})
-                continue
-            key = key_for(rel)
-            dst = STAGE / f"{key}__{src.name}"
-            try:
-                shutil.copy2(src, dst)
-                staged.append((rel, dst))
-            except OSError as e:
-                append({"rel": rel, "status": f"error: stage ({e})",
-                        "attempts": (seen.get(rel, {}).get("attempts", 0) + 1)})
-
-        if not staged:
+    ok = 0
+    for n, (rel, abspath) in enumerate(pending, 1):
+        tb = time.time()
+        attempts = seen.get(rel, {}).get("attempts", 0) + 1
+        src = Path(abspath)
+        if not src.exists():
+            append({"rel": rel, "status": "error: source missing", "attempts": attempts})
             continue
-        chunk_out = STAGE / "_out"
-        cmd = [str(MINERU), "-p", str(STAGE), "-o", str(chunk_out), "-b", "pipeline"]
-        print(f"[{i + len(batch)}/{len(pending)}] mineru on {len(staged)} files "
-              f"({time.time() - t0:.0f}s elapsed)", flush=True)
+        key = key_for(rel)
+        tmp_md = SCRATCH / f"{key}.md"
+        tmp_md.unlink(missing_ok=True)
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600 * 3)
-            if r.returncode != 0:
-                tail = (r.stderr or r.stdout or "")[-300:]
-                for rel, _ in staged:
-                    append({"rel": rel, "status": f"error: mineru rc={r.returncode}",
-                            "attempts": (seen.get(rel, {}).get("attempts", 0) + 1)})
-                print(f"  mineru FAILED rc={r.returncode}: {tail}", flush=True)
-                for _, dst in staged:
-                    dst.unlink(missing_ok=True)
-                continue
+            r = subprocess.run(
+                [MINERU, "parse", str(src), "-o", str(tmp_md),
+                 "--pages", "all", "--tier", "basic", "--wait", str(WAIT_S)],
+                capture_output=True, text=True, timeout=WAIT_S + 120)
         except subprocess.TimeoutExpired:
-            for rel, _ in staged:
-                append({"rel": rel, "status": "error: mineru timeout",
-                        "attempts": (seen.get(rel, {}).get("attempts", 0) + 1)})
+            r = None
+        if r is None or r.returncode != 0 or not tmp_md.exists():
+            why = "timeout" if r is None else ((r.stderr or r.stdout or "no output")[-160:])
+            append({"rel": rel, "status": f"error: parse ({why})", "attempts": attempts})
+            print(f"[{n}/{len(pending)}] FAIL {rel[-60:]}: {why[:80]}", flush=True)
             continue
 
-        # collect results: mineru writes <chunk_out>/<stem>/<name>_*.md per file
-        for rel, dst in staged:
-            tb = time.time()
-            key = key_for(rel)
-            stem = dst.stem
-            md_found = None
-            for cand in chunk_out.rglob("*.md"):
-                if cand.stem.startswith(stem) or cand.stem.startswith(key):
-                    md_found = cand
-                    break
-            attempts = seen.get(rel, {}).get("attempts", 0) + 1
-            if md_found is None:
-                append({"rel": rel, "status": "error: no md produced",
-                        "attempts": attempts})
-                continue
+        try:
             target = OUT / Path(rel).with_suffix(".md")
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                # move sibling images dir if present, rewrite md image links
-                md_text = md_found.read_text(encoding="utf-8")
-                img_dir = md_found.parent / "images"
-                if img_dir.exists():
-                    keep = OUT / "_ocr_images" / key
-                    keep.mkdir(parents=True, exist_ok=True)
-                    for f in img_dir.iterdir():
-                        shutil.copy2(f, keep / f.name)
-                    md_text = md_text.replace("images/", f"_ocr_images/{key}/")
-                target.write_text(md_text, encoding="utf-8")
-                append({"rel": rel, "status": "ok (ocr)",
-                        "attempts": attempts, "secs": round(time.time() - tb, 1)})
-                done += 1
-            except OSError as e:
-                append({"rel": rel, "status": f"error: write ({e})",
-                        "attempts": attempts})
+            target.parent.mkdir(parents=True, exist_ok=True)
+            md_text = tmp_md.read_text(encoding="utf-8")
+            # capture any sibling images dir mineru produced
+            img_src = tmp_md.parent / (tmp_md.stem + "_images")
+            if not img_src.exists():
+                img_src = tmp_md.parent / "images"
+            if img_src.exists():
+                keep = OUT / "_ocr_images" / key
+                keep.mkdir(parents=True, exist_ok=True)
+                for f in img_src.iterdir():
+                    shutil.copy2(f, keep / f.name)
+                md_text = md_text.replace("images/", f"_ocr_images/{key}/")
+            target.write_text(md_text, encoding="utf-8")
+            append({"rel": rel, "status": "ok (ocr)", "attempts": attempts,
+                    "secs": round(time.time() - tb, 1)})
+            ok += 1
+            if n % 10 == 0 or n == len(pending):
+                rate = n / max(time.time() - t0, 1) * 3600
+                print(f"[{n}/{len(pending)}] ok={ok} · {rate:.0f} files/h · "
+                      f"eta {((len(pending)-n)/max(rate/3600,1e-9))/3600:.1f}h", flush=True)
+        except OSError as e:
+            append({"rel": rel, "status": f"error: write ({e})", "attempts": attempts})
+        finally:
+            tmp_md.unlink(missing_ok=True)
 
-        # clean staging for next chunk
-        for _, dst in staged:
-            dst.unlink(missing_ok=True)
-        shutil.rmtree(chunk_out, ignore_errors=True)
-
-    print(f"finished: {done} converted, {len(pending) - done} deferred/errored "
-          f"in {(time.time() - t0) / 60:.1f} min")
+    print(f"finished: {ok} converted, {len(pending)-ok} deferred/errored "
+          f"in {(time.time()-t0)/60:.1f} min", flush=True)
 
 
 if __name__ == "__main__":
