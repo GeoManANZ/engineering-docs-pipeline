@@ -154,6 +154,21 @@ def print_recent(items: list[dict], indent: str = "  ") -> None:
         print(f"{indent}{fmt_size(r['size']):>8}  {fmt_secs(r['secs']):>6}  {tail}")
 
 
+def rsync_info() -> tuple[bool, str]:
+    """(running?, current scope name)"""
+    try:
+        out = subprocess.run(["pgrep", "-af", "rsync.*02[.] Work"],
+                             capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if "pgrep" in line or "bash -c" in line:
+                continue
+            scope = line.split("02. Work/")[-1].split("'")[0].strip().split()[0]
+            return True, scope or "?"
+    except Exception:
+        pass
+    return False, ""
+
+
 def local_workers_alive() -> int:
     try:
         out = subprocess.run(["pgrep", "-f", "pdf-convert-venv/bin/python.*fastpass"],
@@ -279,9 +294,21 @@ def render(state: dict) -> None:
 
     # ── Upload ──
     gb = (vps or {}).get("gb", 0)
+    up = state.get("up_rate")
+    rem = max(0.0, CORPUS_TARGET_GB - gb)
+    up_bits = []
+    if up is not None:
+        up_bits.append(f"{up:.0f} KB/s" if up >= 1 else "stalled")
+        if up and up > 30:
+            up_bits.append(f"~{rem * 2**20 / up / 3600:.1f}h left")
     print(f"{C_GREEN}UPLOAD → VPS{C_RESET}")
-    print(f"  corpus  {bar(gb, CORPUS_TARGET_GB)}  {gb:.1f}/{CORPUS_TARGET_GB:.0f} GB   "
-          f"rsync {'running' if state['rsync'] else C_DIM + 'idle' + C_RESET}")
+    print(f"  corpus  {bar(gb, CORPUS_TARGET_GB)}  {gb:.1f}/{CORPUS_TARGET_GB:.0f} GB"
+          f"  {rem:.1f} GB left")
+    if state["rsync"]:
+        print(f"  active  {C_GREEN}yes{C_RESET} → {state['rsync_scope']}   "
+              f"{' · '.join(up_bits)}")
+    else:
+        print(f"  active  {C_DIM}no (finished or stalled){C_RESET}")
     print()
 
     # ── Stage 2 ──
@@ -305,7 +332,8 @@ def main() -> None:
 
     state: dict = {"first": True, "t0": time.time(), "elapsed": 0.0,
                    "d_lap": 0, "d_vps": 0, "d_gpu": 0, "gpu_rate": 0.0,
-                   "l_prev": None, "v_prev": None, "g_prev": None}
+                   "l_prev": None, "v_prev": None, "g_prev": None,
+                   "up_prev": None, "up_t": None, "up_rate": None}
     try:
         while True:
             loc_seen, _, loc_recent, queue = parse_manifest(FASTPASS_MF)
@@ -332,10 +360,18 @@ def main() -> None:
                 state["g_prev"] = g
                 if state["elapsed"] > 0:
                     state["gpu_rate"] = state["d_gpu"] / state["elapsed"] * 3600
+            # upload rate from fresh vps corpus readings (cache refreshes 60s)
+            if vps and "gb" in vps and vps_cache.get("ts") != state.get("up_t"):
+                if state["up_prev"] is not None and vps_cache["ts"] and state["up_t"]:
+                    dt = vps_cache["ts"] - state["up_t"]
+                    if dt > 5:
+                        state["up_rate"] = max(0.0, (vps["gb"] - state["up_prev"])
+                                               * 2**20 / dt)  # GiB delta -> KB/s
+                state["up_prev"], state["up_t"] = vps["gb"], vps_cache.get("ts")
+            rsync_on, rsync_scope = rsync_info()
             state.update(local=loc, vps=vps, workers=local_workers_alive(),
                          queue=queue, gpu=state.get("g_prev", 0),
-                         rsync=subprocess.run(["pgrep", "-f", "rsync.*02. Work"],
-                                              capture_output=True).returncode == 0)
+                         rsync=rsync_on, rsync_scope=rsync_scope)
             render(state)
             time.sleep(args.refresh)
             state["elapsed"] += args.refresh
